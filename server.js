@@ -2326,19 +2326,18 @@ app.post("/api/waveplan/update", (req, res) => {
     session.wavePlan = { waves: [], config: {} };
   }
 
-  // Merge request config into stored config (UI values override stale stored values)
+  // Merge request config into stored config (UI values ALWAYS override stored values)
   if (reqConfig) {
     session.wavePlan.config = {
-      ...session.wavePlan.config,
-      numWaves: reqConfig.numWaves || session.wavePlan.config.numWaves || wavePlanConfig.defaults.numMigrationWaves,
-      lzDesignWeeks: reqConfig.lzDesignWeeks || session.wavePlan.config.lzDesignWeeks || wavePlanConfig.defaults.lzDesignWeeks,
-      lzProvisionWeeks: reqConfig.lzProvisionWeeks || session.wavePlan.config.lzProvisionWeeks || wavePlanConfig.defaults.lzProvisionWeeks,
-      pilotDurationWeeks: reqConfig.pilotDurationWeeks || session.wavePlan.config.pilotDurationWeeks || wavePlanConfig.defaults.pilotDurationWeeks,
-      waveDurationWeeks: reqConfig.waveDurationWeeks || session.wavePlan.config.waveDurationWeeks || wavePlanConfig.defaults.waveDurationWeeks,
-      bufferDays: reqConfig.bufferDays != null ? reqConfig.bufferDays : (session.wavePlan.config.bufferDays != null ? session.wavePlan.config.bufferDays : wavePlanConfig.defaults.bufferDays),
-      startDate: reqConfig.startDate || session.wavePlan.config.startDate || new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0],
+      numWaves: reqConfig.numWaves || wavePlanConfig.defaults.numMigrationWaves || 3,
+      lzDesignWeeks: reqConfig.lzDesignWeeks || wavePlanConfig.defaults.lzDesignWeeks || 4,
+      lzProvisionWeeks: reqConfig.lzProvisionWeeks || wavePlanConfig.defaults.lzProvisionWeeks || 2,
+      pilotDurationWeeks: reqConfig.pilotDurationWeeks || wavePlanConfig.defaults.pilotDurationWeeks || 8,
+      waveDurationWeeks: reqConfig.waveDurationWeeks || wavePlanConfig.defaults.waveDurationWeeks || 2,
+      bufferDays: reqConfig.bufferDays != null ? reqConfig.bufferDays : (wavePlanConfig.defaults.bufferDays || 3),
+      startDate: reqConfig.startDate || new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0],
       groupBy: reqConfig.groupBy || session.wavePlan.config.groupBy || "application",
-      groupColumn: reqConfig.groupColumn || session.wavePlan.config.groupColumn || null,
+      groupColumn: reqConfig.groupColumn != null ? reqConfig.groupColumn : (session.wavePlan.config.groupColumn || null),
     };
   }
 
@@ -2608,22 +2607,24 @@ app.post("/api/waveplan/llm-suggest", async (req, res) => {
   const maxPilotVMs = pilotW * pilotThroughput;
   const maxWaveVMs = waveDurW * waveThroughput;
 
-  // Assign pilot (wave 0)
-  const maxPilotGroups = wavePlanConfig.defaults.pilotMaxGroups || 3;
+  // Assign pilot (wave 0) — fill up to throughput capacity
   const baseAssignment = {}; // groupName -> waveNumber
   const remaining = [...scoredGroups];
   const wave0Groups = [];
   let pilotCount = 0;
 
-  while (remaining.length > 0 && wave0Groups.length < maxPilotGroups && pilotCount + remaining[0].serverCount <= maxPilotVMs) {
+  // Keep adding lowest-risk groups until we hit pilot capacity
+  while (remaining.length > 0 && pilotCount + remaining[0].serverCount <= maxPilotVMs) {
     const g = remaining.shift();
     wave0Groups.push(g);
     pilotCount += g.serverCount;
     baseAssignment[g.name] = 0;
   }
+  // Ensure at least one group in pilot
   if (wave0Groups.length === 0 && remaining.length > 0) {
     const g = remaining.shift();
     wave0Groups.push(g);
+    pilotCount = g.serverCount;
     baseAssignment[g.name] = 0;
   }
 
@@ -2712,6 +2713,32 @@ Rules:
   const finalAssignment = { ...baseAssignment };
   const groupMeta = {};
 
+  // Always populate groupMeta with tags (Tier, Environment, etc.) for display in AI Insight column
+  for (const [name, srvs] of Object.entries(groups)) {
+    const tags = {};
+    for (const srv of srvs) {
+      if (srv.extraColumns) {
+        for (const col of Object.keys(srv.extraColumns)) {
+          if (metadataColumns.some(mc => col.toLowerCase().includes(mc.toLowerCase()))) {
+            const val = srv.extraColumns[col];
+            if (val) {
+              if (!tags[col]) tags[col] = new Set();
+              tags[col].add(val);
+            }
+          }
+        }
+      }
+      if (srv.environment) {
+        if (!tags["environment"]) tags["environment"] = new Set();
+        tags["environment"].add(srv.environment);
+      }
+    }
+    // Convert sets to joined strings
+    const flatTags = {};
+    for (const [k, v] of Object.entries(tags)) { flatTags[k.toLowerCase()] = [...v].join(", "); }
+    groupMeta[name] = { reason: "", tags: flatTags };
+  }
+
   // Build case-insensitive lookup for group matching
   const groupsLower = {};
   for (const key of Object.keys(groups)) { groupsLower[key.toLowerCase().trim()] = key; }
@@ -2723,7 +2750,7 @@ Rules:
     const actualName = groups[move.group] ? move.group : groupsLower[move.group.toLowerCase().trim()];
     if (actualName) {
       finalAssignment[actualName] = toWave;
-      groupMeta[actualName] = { reason: move.reason || "", tags: {} };
+      groupMeta[actualName].reason = move.reason || `Moved from wave ${baseAssignment[actualName]} → ${toWave}`;
       console.log(`[WavePlan] Moved "${actualName}" from wave ${baseAssignment[actualName]} → wave ${toWave} (${move.reason})`);
     } else {
       console.warn(`[WavePlan] LLM suggested moving "${move.group}" but no matching group found`);

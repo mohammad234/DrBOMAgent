@@ -1783,7 +1783,9 @@ document.getElementById("wpGenerateBtn").addEventListener("click", async () => {
       wavePlanData = plan;
       renderWavePlan(plan);
       const totalAssigned = plan.waves.reduce((s, w) => s + w.totalServers, 0);
-      const moveNote = movesApplied > 0 ? ` (AI applied ${movesApplied} move${movesApplied > 1 ? "s" : ""} per your instructions)` : " (no moves needed — rule-based was already optimal)";
+      const moveNote = movesApplied > 0
+        ? ` — AI applied ${movesApplied} move${movesApplied > 1 ? "s" : ""} per your instructions`
+        : " — rule-based already satisfies your instructions (no moves needed)";
       wpShowStatus(`Wave plan generated: ${plan.waves.length} waves, ${totalAssigned} servers assigned${moveNote}`, "success");
     } else {
       // Rule-based generation
