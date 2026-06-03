@@ -1,0 +1,273 @@
+{
+  "schemaVersion": "1.0",
+  "description": "Config-driven SKU sizing and pricing logic for the Node.js migration assessment agent. The agent reads this file, fetches the live SKU catalog and retail prices for the chosen region, then applies these rules to size and price each server's compute and storage. Aligns the agent's methodology with Azure Migrate (as-allocated, 1 disk per source disk, Standard SSD by default).",
+
+  "region": {
+    "armRegionName": "southeastasia",
+    "displayName": "Southeast Asia",
+    "_note": "Change armRegionName to target a different region, e.g. 'malaysiawest'. Every price lookup and SKU-availability query must be scoped to this region."
+  },
+
+  "rightSizing": {
+    "mode": "as-allocated",
+    "_modeOptions": ["as-allocated", "performance-based"],
+    "_note": "Azure Migrate used as-allocated for this inventory because no utilization data was present. Switch to performance-based only when CPU%/RAM% utilization telemetry is available.",
+    "asAllocated": {
+      "cpuComfortFactor": 1.0,
+      "ramComfortFactor": 1.0
+    },
+    "performanceBased": {
+      "cpuUtilizationPercentile": 95,
+      "ramUtilizationPercentile": 95,
+      "cpuComfortFactor": 1.3,
+      "ramComfortFactor": 1.3,
+      "_note": "requiredCores = ceil(observedCores * cpuPercentileUtil * cpuComfortFactor); same pattern for RAM."
+    }
+  },
+
+  "compute": {
+    "skuCatalog": {
+      "source": "Azure Resource SKUs API",
+      "endpoint": "https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.Compute/skus?api-version=2021-07-01",
+      "queryFilter": "location eq '{armRegionName}'",
+      "keepWhere": {
+        "resourceType": "virtualMachines",
+        "regionAvailable": true,
+        "notRestricted": true,
+        "_note": "Drop any SKU whose restrictions array is non-empty for the target region (NotAvailableForSubscription / location). Read vCPUs and MemoryGB from the capabilities array."
+      },
+      "capabilityFields": {
+        "vCPUs": "vCPUs",
+        "memoryGB": "MemoryGB"
+      }
+    },
+
+    "familySelection": {
+      "method": "ram-per-core-ratio",
+      "_note": "ratio = requiredRamGB / requiredCores. Walk rules top-down; first rule whose maxRamPerCore >= ratio wins. families are tried in listed priority order during SKU matching.",
+      "rules": [
+        { "maxRamPerCore": 2.0,  "families": ["Dalsv5", "Dasv5"],  "intent": "low-memory general purpose" },
+        { "maxRamPerCore": 4.0,  "families": ["Dasv5", "Dalsv5"],  "intent": "general purpose (default)" },
+        { "maxRamPerCore": 8.0,  "families": ["Easv5", "Dasv5"],   "intent": "memory optimized" },
+        { "maxRamPerCore": 999.0,"families": ["Easv5", "Mv2", "M"],"intent": "high memory / very large" }
+      ],
+      "defaultFamily": "Dasv5",
+      "familyPrefixMap": {
+        "Dalsv5": "Standard_D{n}als_v5",
+        "Dasv5":  "Standard_D{n}as_v5",
+        "Easv5":  "Standard_E{n}as_v5",
+        "Mv2":    "Standard_M{n}s_v2",
+        "M":      "Standard_M{n}s"
+      }
+    },
+
+    "selectionAlgorithm": {
+      "constraints": [
+        "candidate.vCPUs   >= requiredCores",
+        "candidate.memoryGB >= requiredRamGB"
+      ],
+      "objective": "minimize monthlyComputePrice",
+      "tieBreakers": ["smallest vCPUs", "smallest memoryGB", "alphabetical skuName"],
+      "fallback": "If no SKU in the selected family list satisfies both constraints, advance to the next family in the rule; if all listed families fail, search the entire region catalog for the cheapest SKU meeting both constraints and flag the row as 'family-fallback'."
+    },
+
+    "minimums": { "vCPUs": 2, "memoryGB": 4 },
+
+    "pricing": {
+      "source": "Azure Retail Prices API",
+      "endpoint": "https://prices.azure.com/api/retail/prices",
+      "apiVersion": "2023-01-01-preview",
+      "queryFilter": "serviceName eq 'Virtual Machines' and armRegionName eq '{armRegionName}' and priceType eq 'Consumption'",
+      "keepWhere": {
+        "armSkuName": "{selectedSkuName}",
+        "unitOfMeasure": "1 Hour",
+        "type": "Consumption"
+      },
+      "excludeWhere": {
+        "skuNameContains": ["Spot", "Low Priority"],
+        "meterNameContains": ["Spot", "Low Priority", "Windows"],
+        "productNameContains": ["Windows"]
+      },
+      "_pricingNote": "Use the LINUX base rate (retailPrice). Do not use Windows meters; handle Windows licensing via Azure Hybrid Benefit separately. Exclude Spot / Low Priority. There is usually one Consumption Linux hourly meter per armSkuName per region.",
+      "monthlyConversion": {
+        "hoursPerMonth": 730,
+        "formula": "monthlyComputePrice = retailPrice * 730"
+      }
+    },
+
+    "licensing": {
+      "azureHybridBenefit": {
+        "applyToWindows": true,
+        "applyToLinux": false,
+        "_note": "Capture AHB savings as a separate line, do not bake into base compute. Azure Migrate reports it in its own column. Only apply when the customer confirms Software Assurance / RHEL-SUSE cloud subscription eligibility."
+      }
+    }
+  },
+
+  "storage": {
+    "diskType": "StandardSSD",
+    "_diskTypeOptions": ["StandardSSD", "PremiumSSD", "StandardHDD"],
+    "_diskTypeNote": "Default StandardSSD to match Azure Migrate for as-allocated, non-performance-sized workloads. Switch to PremiumSSD only for confirmed latency/IOPS-sensitive tiers (e.g. production databases). StandardHDD for cold/archival storage.",
+    "redundancy": "LRS",
+
+    "diskCounting": {
+      "rule": "one-managed-disk-per-source-disk",
+      "_note": "CRITICAL: emit one priced disk row per source disk. Do NOT collapse multiple disks of a server into a single disk. If a server has 4 data disks, size and price 4 disks."
+    },
+
+    "sizing": {
+      "method": "smallest-tier-fitting-capacity",
+      "inputField": "sourceDiskSizeGB",
+      "rule": "Select the smallest tier whose maxGiB >= sourceDiskSizeGB.",
+      "tierTable": {
+        "StandardSSD": [
+          { "tier": "E1",  "maxGiB": 4 },
+          { "tier": "E2",  "maxGiB": 8 },
+          { "tier": "E3",  "maxGiB": 16 },
+          { "tier": "E4",  "maxGiB": 32 },
+          { "tier": "E6",  "maxGiB": 64 },
+          { "tier": "E10", "maxGiB": 128 },
+          { "tier": "E15", "maxGiB": 256 },
+          { "tier": "E20", "maxGiB": 512 },
+          { "tier": "E30", "maxGiB": 1024 },
+          { "tier": "E40", "maxGiB": 2048 },
+          { "tier": "E50", "maxGiB": 4096 },
+          { "tier": "E60", "maxGiB": 8192 },
+          { "tier": "E70", "maxGiB": 16384 },
+          { "tier": "E80", "maxGiB": 32767 }
+        ],
+        "PremiumSSD": [
+          { "tier": "P1",  "maxGiB": 4 },
+          { "tier": "P2",  "maxGiB": 8 },
+          { "tier": "P3",  "maxGiB": 16 },
+          { "tier": "P4",  "maxGiB": 32 },
+          { "tier": "P6",  "maxGiB": 64 },
+          { "tier": "P10", "maxGiB": 128 },
+          { "tier": "P15", "maxGiB": 256 },
+          { "tier": "P20", "maxGiB": 512 },
+          { "tier": "P30", "maxGiB": 1024 },
+          { "tier": "P40", "maxGiB": 2048 },
+          { "tier": "P50", "maxGiB": 4096 },
+          { "tier": "P60", "maxGiB": 8192 },
+          { "tier": "P70", "maxGiB": 16384 },
+          { "tier": "P80", "maxGiB": 32767 }
+        ],
+        "StandardHDD": [
+          { "tier": "S4",  "maxGiB": 32 },
+          { "tier": "S6",  "maxGiB": 64 },
+          { "tier": "S10", "maxGiB": 128 },
+          { "tier": "S15", "maxGiB": 256 },
+          { "tier": "S20", "maxGiB": 512 },
+          { "tier": "S30", "maxGiB": 1024 },
+          { "tier": "S40", "maxGiB": 2048 },
+          { "tier": "S50", "maxGiB": 4096 },
+          { "tier": "S60", "maxGiB": 8192 },
+          { "tier": "S70", "maxGiB": 16384 },
+          { "tier": "S80", "maxGiB": 32767 }
+        ]
+      },
+      "oversizeGuard": {
+        "enabled": true,
+        "_note": "If sourceDiskSizeGB > 32767, split across multiple max-tier disks and sum their prices."
+      }
+    },
+
+    "pricing": {
+      "source": "Azure Retail Prices API",
+      "endpoint": "https://prices.azure.com/api/retail/prices",
+      "apiVersion": "2023-01-01-preview",
+      "queryFilter": "serviceName eq 'Storage' and armRegionName eq '{armRegionName}' and priceType eq 'Consumption'",
+      "keepWhere": {
+        "productNameContains_StandardSSD": "Standard SSD Managed Disks",
+        "productNameContains_PremiumSSD": "Premium SSD Managed Disks",
+        "skuNameStartsWith": "{tier}",
+        "meterNameContains": "Disk",
+        "unitOfMeasureContains": "1/Month"
+      },
+      "excludeWhere": {
+        "meterNameContains": ["Transactions", "IOPS", "Throughput", "Operations", "Mount", "Snapshot", "ZRS"]
+      },
+      "_pricingNote": "Managed-disk capacity price is already per-month for the WHOLE disk (flat per tier, not per GiB). Take the 'X Disks' / 'X LRS Disk' per-month meter, NOT transaction/IOPS/throughput meters. Match skuName to the selected tier exactly (e.g. 'E15 LRS Disk'). Do not multiply by size — the tier price is the full monthly cost of that disk."
+    }
+  },
+
+  "security": {
+    "defenderForCloud": {
+      "include": true,
+      "plan": "Defender for Servers Plan 2",
+      "monthlyCostPerServer": 15.00,
+      "_note": "Azure Migrate adds a security line (~$17.5k/mo on this inventory). Price Defender for Servers per protected server-hour or per server/month from the retail API (serviceName eq 'Microsoft Defender for Cloud') and add it as its own line so the agent total reconciles to Azure Migrate."
+    }
+  },
+
+  "cpuArchitecture": {
+    "default": "amd",
+    "options": [
+      { "id": "amd", "label": "AMD (Recommended)", "desc": "AMD-based SKUs (as_v5, ads_v5) — matches Azure Migrate default", "skuPattern": "a[a-z]*_v" },
+      { "id": "intel", "label": "Intel", "desc": "Intel-based SKUs (s_v5, ds_v5)", "skuPattern": "(?<!a)[a-z]*s_v" },
+      { "id": "auto", "label": "Automatic (Best Fit)", "desc": "Let sizing logic decide based on cost/availability — no architecture filter" }
+    ],
+    "_note": "AMD SKUs contain 'a' after the size number (e.g., D8as_v5). Intel SKUs do not (e.g., D8s_v5). 'auto' applies no filter. The pattern is matched against the portion after Standard_X<N> in the SKU name."
+  },
+
+  "vmSeriesPreference": [
+    { "id": "Standard_D", "name": "D-Series (General Purpose)", "desc": "Balanced CPU/memory", "defaultEnabled": true },
+    { "id": "Standard_E", "name": "E-Series (Memory Optimized)", "desc": "High memory-to-core ratio", "defaultEnabled": true },
+    { "id": "Standard_F", "name": "F-Series (Compute Optimized)", "desc": "High CPU-to-memory ratio", "defaultEnabled": true },
+    { "id": "Standard_L", "name": "L-Series (Storage Optimized)", "desc": "High disk throughput", "defaultEnabled": true },
+    { "id": "Standard_M", "name": "M-Series (Memory Intensive)", "desc": "Very large memory workloads", "defaultEnabled": true },
+    { "id": "Standard_B", "name": "B-Series (Burstable)", "desc": "Low-cost burstable workloads", "defaultEnabled": false },
+    { "id": "Standard_A", "name": "A-Series (Basic)", "desc": "Entry-level, dev/test", "defaultEnabled": false },
+    { "id": "Standard_NC", "name": "NC-Series (GPU)", "desc": "GPU compute (AI/ML)", "defaultEnabled": false },
+    { "id": "Standard_NV", "name": "NV-Series (GPU Visualization)", "desc": "GPU for VDI", "defaultEnabled": false }
+  ],
+
+  "pricingModels": [
+    { "id": "payg", "name": "Pay As You Go", "filter": "priceType eq 'Consumption'", "divisor": 1, "label": "PAYG" },
+    { "id": "1yr_ri", "name": "1-Year Reserved Instance", "filter": "priceType eq 'Reservation' and reservationTerm eq '1 Year'", "divisor": 12, "label": "1yr RI" },
+    { "id": "3yr_ri", "name": "3-Year Reserved Instance", "filter": "priceType eq 'Reservation' and reservationTerm eq '3 Years'", "divisor": 36, "label": "3yr RI" }
+  ],
+
+  "ahubOptions": [
+    { "id": "ahub", "name": "Azure Hybrid Benefit (AHUB)", "desc": "Use existing Windows Server licenses", "default": true },
+    { "id": "no_ahub", "name": "No AHUB (Include License)", "desc": "Pay full Windows license cost", "default": false }
+  ],
+
+  "regions": [
+    { "value": "southeastasia", "label": "Southeast Asia (Singapore)" },
+    { "value": "eastasia", "label": "East Asia (Hong Kong)" },
+    { "value": "australiaeast", "label": "Australia East (Sydney)" },
+    { "value": "australiasoutheast", "label": "Australia Southeast (Melbourne)" },
+    { "value": "japaneast", "label": "Japan East (Tokyo)" },
+    { "value": "centralindia", "label": "Central India (Pune)" },
+    { "value": "uksouth", "label": "UK South (London)" },
+    { "value": "northeurope", "label": "North Europe (Ireland)" },
+    { "value": "westeurope", "label": "West Europe (Netherlands)" },
+    { "value": "centralus", "label": "Central US (Iowa)" },
+    { "value": "eastus", "label": "East US (Virginia)" },
+    { "value": "eastus2", "label": "East US 2 (Virginia)" },
+    { "value": "westus2", "label": "West US 2 (Washington)" },
+    { "value": "koreacentral", "label": "Korea Central (Seoul)" },
+    { "value": "malaysiawest", "label": "Malaysia West (Kuala Lumpur)" }
+  ],
+
+  "matching": {
+    "batchSizeForLLM": 30,
+    "maxVmSizesInPrompt": 60,
+    "excludePatterns": ["Promo", "Basic_", "_Spot", "Low_Priority"]
+  },
+
+  "retailApi": {
+    "maxPages": 30,
+    "diskMeterExcludePatterns": ["Disk Mount", "Disk Operations", "ZRS", "Burst", "Snapshot", "Transactions", "IOPS", "Throughput"],
+    "diskRedundancyFilter": "LRS",
+    "diskMeterRegex": "^([PES]\\d+) LRS Disk$"
+  },
+
+  "outputContract": {
+    "perServer": ["serverName", "businessApplication", "environment", "os", "sourceCores", "sourceRamGB", "ramPerCore", "selectedFamily", "recommendedVm", "vmCores", "vmRamGB", "monthlyComputePrice", "ahbSavings"],
+    "perDisk": ["serverName", "sourceDiskName", "sourceDiskSizeGB", "diskType", "selectedTier", "tierMaxGiB", "monthlyStoragePrice"],
+    "summary": ["totalMonthlyCompute", "totalMonthlyStorage", "totalMonthlySecurity", "totalMonthly", "totalAnnual"],
+    "reconciliationRule": "totalMonthlyCompute MUST equal the sum of every row's monthlyComputePrice; totalMonthlyStorage MUST equal the sum of every disk's monthlyStoragePrice. Assert this in code before writing the summary."
+  }
+}

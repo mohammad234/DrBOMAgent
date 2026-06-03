@@ -1,0 +1,5 @@
+node_modules/
+output/
+uploads/
+saved_sessions/
+.llm-config.json

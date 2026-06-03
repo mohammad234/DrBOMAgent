@@ -1,0 +1,17 @@
+{
+  "name": "dr-bom-agent",
+  "version": "1.0.0",
+  "description": "Dr. BOM Agent — Azure Migrate Assessment, TCO Analysis, BOM Builder & Wave Planner",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "quick": "node server.js --skip-setup",
+    "setup": "npm install && node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "multer": "^2.1.1",
+    "open": "^10.1.0",
+    "xlsx": "^0.18.5"
+  }
+}

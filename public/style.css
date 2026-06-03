@@ -1,0 +1,191 @@
+/* ========== DR. TCO AGENT - Custom Styles (Bootstrap 5 base) ========== */
+
+/* Utility override - keep .hidden for JS toggles (Bootstrap uses d-none) */
+.hidden { display: none !important; }
+
+/* Consistent button heights across steps */
+.card-body .btn { min-height: 38px; }
+.card-body .btn-sm { min-height: 38px; display: inline-flex; align-items: center; }
+
+/* ========== STEPPER (no Bootstrap equivalent) ========== */
+.steps {
+  display: flex; justify-content: space-between; gap: 4px;
+}
+.step {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  font-size: 0.75em; color: #333; font-weight: 500; flex: 1;
+  cursor: pointer; transition: transform 0.15s;
+}
+.step:hover { transform: scale(1.05); }
+.step span {
+  display: flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: 50%;
+  background: #e8e8e8; color: #999; font-weight: 700; font-size: 1.1em;
+  transition: all 0.2s;
+}
+.step label { text-align: center; cursor: pointer; }
+.step.active { color: #0d6efd; }
+.step.active span { background: #0d6efd; color: white; }
+.step.done { color: #198754; }
+.step.done span { background: #198754; color: white; }
+
+/* ========== PANEL VISIBILITY ========== */
+.panel.hidden { display: none !important; }
+
+/* ========== CONFIG SIDE PANEL ========== */
+.config-panel {
+  position: fixed; top: 0; right: -32%; width: 30%; min-width: 340px; height: 100vh;
+  background: white; border-left: 1px solid #dee2e6;
+  box-shadow: -4px 0 20px rgba(0,0,0,0.1);
+  z-index: 1050; transition: right 0.3s ease;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.config-panel.open { right: 0; }
+
+/* ========== HISTORY SIDEBAR (Left) ========== */
+.history-sidebar {
+  position: fixed; top: 0; left: -320px; width: 300px; height: 100vh;
+  background: white; border-right: 1px solid #dee2e6;
+  box-shadow: 4px 0 20px rgba(0,0,0,0.08);
+  z-index: 1050; transition: left 0.3s ease;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.history-sidebar.open { left: 0; }
+.history-sidebar-header { background: #f8f9fa; }
+.history-sidebar-body .list-group-item {
+  padding: 0.6rem 0.75rem; border: none; border-bottom: 1px solid #f0f0f0; cursor: pointer;
+}
+.history-sidebar-body .list-group-item:hover { background: #f0f7ff; }
+.history-sidebar-body .list-group-item .session-name { font-weight: 600; font-size: 0.85rem; }
+.history-sidebar-body .list-group-item .session-meta { font-size: 0.75rem; color: #6c757d; }
+.history-sidebar-body .list-group-item .session-step-badge {
+  font-size: 0.65rem; padding: 2px 6px; border-radius: 3px;
+  background: #e8f5e9; color: #2e7d32; font-weight: 600;
+}
+.history-sidebar-body .list-group-item .session-outputs {
+  font-size: 0.72rem; color: #555; line-height: 1.5; padding-left: 4px;
+  border-left: 2px solid #e0e0e0; margin-left: 2px;
+}
+
+.panel-overlay {
+  position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+  background: rgba(0,0,0,0.3); z-index: 1040; transition: opacity 0.3s;
+}
+.panel-overlay.hidden { opacity: 0; pointer-events: none; }
+
+/* ========== STATUS INDICATORS ========== */
+.status-indicator {
+  width: 22px; height: 22px; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 0.75em; font-weight: 700;
+  flex-shrink: 0;
+}
+.status-indicator.on { background: #198754; color: white; }
+.status-indicator.on::after { content: "\2713"; }
+.status-indicator.off { background: #dee2e6; color: #999; }
+.status-indicator.off::after { content: ""; }
+
+/* ========== AGENTIC BADGE ========== */
+.agentic-badge {
+  margin-top: 10px; background: linear-gradient(135deg, #667eea, #764ba2);
+  color: white; border-radius: 6px; padding: 8px 12px;
+  font-size: 0.82em; font-weight: 600; text-align: center;
+}
+
+/* ========== UPLOAD AREA ========== */
+.upload-area {
+  border: 2px dashed #ced4da; border-radius: 10px; padding: 45px 30px;
+  text-align: center; cursor: pointer; transition: all 0.2s;
+}
+.upload-area:hover, .upload-area.dragover { border-color: #0d6efd; background: #f0f8ff; }
+.upload-icon { font-size: 2.8em; margin-bottom: 8px; color: #6c757d; }
+
+/* ========== CUSTOMER NAME BANNER ========== */
+.customer-name-banner { color: #0d6efd; font-weight: 600; font-size: 0.95rem; margin-bottom: 8px; }
+
+/* ========== MAPPING TABLE ROWS ========== */
+.mapping-row-ok { background: #f0fff4 !important; }
+.mapping-row-miss { background: #fff5f5 !important; }
+.mapping-table td:nth-child(2) { color: #0d6efd; font-weight: 500; }
+
+/* ========== STEP 3 SUMMARY CARDS ========== */
+.summary-card-compute { background: linear-gradient(135deg, #2193b0, #6dd5ed); color: white; }
+.summary-card-storage { background: linear-gradient(135deg, #11998e, #38ef7d); color: white; }
+.summary-card-security { background: linear-gradient(135deg, #f7971e, #ffd200); color: #333; }
+
+/* ========== STEP 4 SUMMARY CARDS ========== */
+.assess-summary-card {
+  border-radius: 8px; padding: 14px; text-align: center; color: white;
+  height: 100%; display: flex; flex-direction: column; justify-content: center;
+}
+.assess-summary-card.purple { background: linear-gradient(135deg, #667eea, #764ba2); }
+.assess-summary-card.green { background: linear-gradient(135deg, #11998e, #38ef7d); }
+.assess-summary-card.blue { background: linear-gradient(135deg, #2193b0, #6dd5ed); }
+.assess-summary-card.orange { background: linear-gradient(135deg, #f7971e, #ffd200); color: #333; }
+.assess-summary-card .card-value { font-size: 1.4em; font-weight: 700; }
+.assess-summary-card .card-label { font-size: 0.75em; opacity: 0.9; margin-top: 2px; }
+
+/* ========== ENVIRONMENT TABS ========== */
+.env-tab-pane { padding: 16px 0; }
+.env-status-badge { font-size: 0.7em; margin-left: 6px; }
+.env-complete-check { color: #198754; font-weight: bold; }
+.env-needs-rerun { color: #dc3545; font-size: 0.7em; margin-left: 4px; }
+#envTabs .nav-link.active { background-color: #0d6efd; color: #fff; border-color: #0d6efd; }
+#envTabs .nav-link { color: #495057; }
+.combined-total-bar {
+  background: linear-gradient(135deg, #1a1a2e, #16213e);
+  border-radius: 10px; padding: 16px 20px; color: white;
+  display: flex; justify-content: space-around; flex-wrap: wrap; gap: 12px;
+}
+.combined-total-bar .total-item { text-align: center; }
+.combined-total-bar .total-value { font-size: 1.3em; font-weight: 700; color: #00e676; }
+.combined-total-bar .total-label { font-size: 0.72em; opacity: 0.8; }
+
+/* ========== BOM COST TABLE (Steps 5 & 6) ========== */
+.bom-cost-table-wrapper { max-width: 700px; }
+.bom-cost-table { font-size: 0.92em; }
+.bom-cost-table thead th { font-weight: 600; }
+.bom-section-header td {
+  background: #e8f4fd !important; border-bottom: 2px solid #b8daff;
+  padding: 10px 14px;
+}
+.bom-sub-item { padding-left: 32px !important; color: #444; }
+.bom-input {
+  width: 160px; text-align: right; float: right;
+}
+.bom-total-row td {
+  background: #1a1a2e !important; color: white !important; padding: 12px 14px;
+  font-size: 1.05em; border-bottom: none;
+}
+.bom-total-row strong { color: white; }
+.bom-readonly { font-weight: 500; color: #555; }
+
+/* ========== TOAST NOTIFICATION ========== */
+.toast-notification {
+  position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+  background: #1a1a2e; color: white; padding: 10px 24px; border-radius: 6px;
+  font-size: 0.88em; z-index: 9999; transition: opacity 0.3s;
+}
+.toast-notification.hidden { opacity: 0; pointer-events: none; }
+
+/* ========== DEVICE CODE DISPLAY ========== */
+.device-code-display { margin-top: 8px; }
+.device-link { word-break: break-all; }
+.device-code-value { letter-spacing: 4px; }
+
+/* ========== LOG ENTRIES (assessment status) ========== */
+.status-log {
+  background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px;
+  padding: 12px; font-family: monospace; font-size: 0.82em;
+  max-height: 180px; overflow-y: auto;
+}
+.log-entry { padding: 3px 0; border-bottom: 1px solid #eee; }
+.log-entry.success { color: #198754; }
+.log-entry.error { color: #dc3545; }
+.log-entry.info { color: #0d6efd; }
+
+/* ========== RESPONSIVE ========== */
+@media (max-width: 768px) {
+  .steps { flex-wrap: wrap; gap: 6px; }
+  .config-panel { width: 85%; min-width: unset; right: -90%; }
+  .bom-cost-table-wrapper { max-width: 100%; }
+}

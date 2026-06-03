@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dr. BOM Agent</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-light">
+
+  <!-- Config Panel (Right Side) -->
+  <aside id="configPanel" class="config-panel">
+    <div class="config-panel-header d-flex justify-content-between align-items-center p-3 border-bottom bg-light">
+      <h5 class="mb-0"><i class="bi bi-gear"></i> Setup</h5>
+      <button id="closeConfigPanel" class="btn-close"></button>
+    </div>
+    <div class="config-panel-body p-3 overflow-auto flex-grow-1">
+
+      <!-- 1. Azure Login -->
+      <div class="card mb-3">
+        <div class="card-body p-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <span class="fw-semibold small">Azure Login</span>
+            <span id="azureStatusIndicator" class="status-indicator off" title="Not connected"></span>
+          </div>
+          <div id="azureLoggedOutView">
+            <p class="text-muted small mb-2">Sign in like <code>az login</code> &mdash; no app registration needed.</p>
+            <button class="btn btn-primary btn-sm" id="azureLoginBtn"><i class="bi bi-lock"></i> Login to Azure</button>
+            <div id="deviceCodeBox" class="hidden mt-3">
+              <p class="small text-primary fw-medium">Open the link below and enter the code:</p>
+              <div class="device-code-display bg-dark rounded p-3 text-center">
+                <a id="deviceCodeLink" href="#" target="_blank" class="device-link text-info small"></a>
+                <div class="device-code-value text-warning fw-bold fs-3 mt-2 font-monospace" id="deviceCodeValue"></div>
+              </div>
+              <div id="deviceCodePolling" class="text-muted small mt-2">Waiting for you to complete sign-in...</div>
+            </div>
+            <div id="loginStatus" class="hidden mt-2"></div>
+          </div>
+          <div id="azureLoggedInView" class="hidden">
+            <div class="alert alert-success py-2 mb-0 text-center small fw-medium"><i class="bi bi-check-circle"></i> Connected to Azure</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Subscription -->
+      <div class="card mb-3">
+        <div class="card-body p-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <span class="fw-semibold small">Azure Subscription</span>
+            <span id="subStatusIndicator" class="status-indicator off" title="Not selected"></span>
+          </div>
+          <select class="form-select form-select-sm" id="subscriptionSelect" disabled>
+            <option value="">Login to Azure first</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 3. Azure AI -->
+      <div class="card mb-3">
+        <div class="card-body p-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <span class="fw-semibold small">Azure AI</span>
+            <span id="llmStatusIndicator" class="status-indicator off" title="Not configured"></span>
+          </div>
+          <p class="text-muted small mb-2">Optional &mdash; enables Agentic workflow execution.</p>
+          <div class="mb-2">
+            <label class="form-label small mb-1">Provider Type:</label>
+            <select class="form-select form-select-sm" id="aiProviderType">
+              <option value="azure-openai" selected>Azure OpenAI</option>
+              <option value="serverless">Serverless Model (Foundry MaaS)</option>
+            </select>
+          </div>
+          <!-- Azure OpenAI selection -->
+          <div id="azureOpenAISection">
+            <div class="mb-2">
+              <label for="openaiAccountSelect" class="form-label small mb-1">AI Foundry Endpoint:</label>
+              <select class="form-select form-select-sm" id="openaiAccountSelect" disabled>
+                <option value="">Select subscription first</option>
+              </select>
+            </div>
+            <div class="mb-2">
+              <label for="openaiDeploymentSelect" class="form-label small mb-1">Deployment Name:</label>
+              <select class="form-select form-select-sm" id="openaiDeploymentSelect" disabled>
+                <option value="">Select endpoint first</option>
+              </select>
+            </div>
+          </div>
+          <!-- Serverless model selection -->
+          <div id="serverlessSection" class="hidden">
+            <div class="mb-2">
+              <label for="serverlessEndpointSelect" class="form-label small mb-1">Serverless Model:</label>
+              <select class="form-select form-select-sm" id="serverlessEndpointSelect" disabled>
+                <option value="">Select subscription first</option>
+              </select>
+            </div>
+            <div class="mb-2">
+              <label for="serverlessApiKey" class="form-label small mb-1">API Key (from Foundry):</label>
+              <input type="password" class="form-control form-control-sm" id="serverlessApiKey" placeholder="Enter serverless endpoint key">
+            </div>
+          </div>
+          <span id="llmConfigStatus" class="text-muted small"></span>
+          <div id="agenticModeLabel" class="agentic-badge hidden">
+            <div class="d-flex justify-content-between align-items-center">
+              <span><i class="bi bi-lightning"></i> AI Mode: ON</span>
+              <div class="form-check form-switch mb-0 ms-2">
+                <input class="form-check-input" type="checkbox" id="aiModeToggle" checked>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </aside>
+
+  <!-- Panel Overlay -->
+  <div id="panelOverlay" class="panel-overlay hidden"></div>
+
+  <!-- History Sidebar (Left) -->
+  <aside id="historySidebar" class="history-sidebar">
+    <div class="history-sidebar-header d-flex justify-content-between align-items-center p-3 border-bottom">
+      <h6 class="mb-0"><i class="bi bi-clock-history"></i> History</h6>
+      <button id="closeHistoryBtn" class="btn-close btn-close-sm"></button>
+    </div>
+    <div class="history-sidebar-body p-2 overflow-auto flex-grow-1">
+      <div id="historySessionsList" class="list-group list-group-flush"></div>
+      <div id="historyEmpty" class="text-center text-muted small p-3 hidden">
+        <i class="bi bi-inbox" style="font-size:2rem;"></i>
+        <p class="mt-2 mb-0">No saved sessions yet.<br>Sessions auto-save after assessment.</p>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <div class="container py-4">
+    <header class="text-center mb-4">
+      <div class="header-top d-flex justify-content-center align-items-center position-relative">
+        <button id="openHistoryBtn" class="btn btn-outline-secondary btn-sm position-absolute start-0" title="Session History"><i class="bi bi-list"></i></button>
+        <h1 class="text-primary fw-bold">Dr. BOM Agent</h1>
+        <button id="openConfigPanel" class="btn btn-primary btn-sm position-absolute end-0" title="Open Setup Panel"><i class="bi bi-gear"></i> Setup</button>
+      </div>
+      <p class="text-muted small mt-1">Upload Inventory &rarr; Convert &rarr; Assess &rarr; Full BOM View</p>
+    </header>
+
+    <!-- Progress Steps (7 steps) -->
+    <div class="steps bg-white rounded-3 shadow-sm p-3 mb-4">
+      <div class="step active" data-step="1"><span>1</span><label>Data Collection</label></div>
+      <div class="step" data-step="2"><span>2</span><label>Map and Review</label></div>
+      <div class="step" data-step="3"><span>3</span><label>VM Assess</label></div>
+      <div class="step" data-step="4"><span>4</span><label>Assessment Report</label></div>
+      <div class="step" data-step="5"><span>5</span><label>LZ &amp; BCDR</label></div>
+      <div class="step" data-step="6"><span>6</span><label>BOM</label></div>
+      <div class="step" data-step="7"><span>7</span><label>Wave Plan</label></div>
+    </div>
+
+    <!-- STEP 1: Upload -->
+    <section id="step1" class="card shadow-sm mb-4 panel active">
+      <div class="card-body p-4">
+        <h4 class="card-title mb-2">Step 1: Upload Customer Inventory</h4>
+        <p class="text-muted small mb-3">Upload your server inventory CSV or Excel file. Columns will be mapped to Azure Migrate import format.</p>
+        <div class="mb-3" style="max-width:400px;">
+          <label for="customerNameInput" class="form-label fw-semibold">Customer Name: <span class="text-danger">*</span></label>
+          <input type="text" class="form-control" id="customerNameInput" placeholder="e.g., Alliance Bank" required>
+          <div class="invalid-feedback" id="customerNameFeedback">Please enter a customer name before uploading.</div>
+        </div>
+        <div class="upload-area" id="uploadArea">
+          <div class="upload-icon"><i class="bi bi-folder2-open"></i></div>
+          <p class="mb-1">Drag &amp; drop your inventory file here, or click to browse</p>
+          <p class="text-muted small">Accepted: .csv, .xlsx, .xls (max 100MB)</p>
+          <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" hidden>
+        </div>
+        <div id="uploadProgress" class="progress hidden mt-3" style="height:28px;">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%">Uploading...</div>
+        </div>
+        <div id="uploadError" class="alert alert-danger hidden mt-3"></div>
+      </div>
+    </section>
+
+    <!-- STEP 2: Review -->
+    <section id="step2" class="card shadow-sm mb-4 panel hidden">
+      <div class="card-body p-4">
+        <h4 class="card-title mb-1">Step 2: Review Column Mapping</h4>
+        <div class="customer-name-banner" id="step2CustomerName"></div>
+        <p class="text-muted small mb-3">Review how your source inventory columns are mapped to Azure Migrate format. Accept to generate the import-ready CSV.</p>
+
+        <!-- Column Mapping Table -->
+        <div id="columnMappingSection" class="mt-3">
+          <h6 class="fw-semibold">Column Mapping</h6>
+          <div class="table-responsive border rounded" style="max-height:350px;overflow:auto;">
+            <table id="columnMappingTable" class="table table-sm table-hover mb-0 mapping-table">
+              <thead class="table-light"><tr><th>Source Column</th><th>Azure Migrate Column</th><th>Reason</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="mt-3 d-flex gap-2 align-items-center flex-wrap">
+            <button class="btn btn-primary btn-sm" id="acceptMappingBtn"><i class="bi bi-check-lg"></i> Accept Mapping &amp; Generate CSV</button>
+            <button class="btn btn-outline-secondary btn-sm" id="aiFixMappingBtn"><i class="bi bi-robot"></i> Let AI Agent Handle Mapping</button>
+            <span id="mappingAcceptStatus" class="text-muted small"></span>
+          </div>
+        </div>
+
+        <!-- Stats (shown after accept) -->
+        <div id="conversionResults" class="hidden mt-4">
+          <h6 class="fw-semibold">Conversion Results</h6>
+          <div class="row g-3 mb-3">
+            <div class="col-md-4"><div class="card text-center border-success"><div class="card-body py-3"><div class="fs-3 fw-bold text-success" id="validCount">0</div><div class="text-muted small">Valid Servers</div></div></div></div>
+            <div class="col-md-4"><div class="card text-center border-warning"><div class="card-body py-3"><div class="fs-3 fw-bold text-warning" id="invalidCount">0</div><div class="text-muted small">Excluded Servers</div></div></div></div>
+            <div class="col-md-4"><div class="card text-center border-info"><div class="card-body py-3"><div class="fs-3 fw-bold text-info" id="totalCount">0</div><div class="text-muted small">Total Input</div></div></div></div>
+          </div>
+
+          <div id="errorsSection" class="hidden">
+            <h6 class="fw-semibold">Excluded Servers (Incomplete Details)</h6>
+            <p class="text-muted small">These are missing required fields and excluded from the Azure Migrate CSV.</p>
+            <div class="table-responsive border rounded" style="max-height:250px;overflow:auto;">
+              <table id="errorsTable" class="table table-sm table-hover mb-0"><thead class="table-light"><tr><th>Server Name</th><th>Error</th></tr></thead><tbody></tbody></table>
+            </div>
+          </div>
+
+          <div class="mt-3">
+            <h6 class="fw-semibold">Conversion Report</h6>
+            <pre id="reportContent" class="bg-dark text-light p-3 rounded small" style="max-height:300px;overflow:auto;"></pre>
+          </div>
+
+          <div class="d-flex gap-2 flex-wrap mt-3">
+            <button class="btn btn-primary btn-sm" id="downloadAzMigrate"><i class="bi bi-download"></i> Azure Migrate CSV</button>
+            <button class="btn btn-warning btn-sm" id="downloadExcluded"><i class="bi bi-download"></i> Excluded Servers</button>
+            <button class="btn btn-secondary btn-sm" id="downloadReport"><i class="bi bi-download"></i> Report (.txt)</button>
+          </div>
+        </div>
+
+        <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+          <button class="btn btn-outline-secondary btn-sm" id="reuploadBtn"><i class="bi bi-arrow-clockwise"></i> Re-upload</button>
+          <button class="btn btn-primary btn-sm hidden" id="proceedToProject">Next: Create Project <i class="bi bi-arrow-right"></i></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 3: VM Assessment -->
+    <section id="step3" class="card shadow-sm mb-4 panel hidden">
+      <div class="card-body p-4">
+        <h4 class="card-title mb-2">Step 3: VM Assessment</h4>
+
+        <!-- Customer Name -->
+        <div id="step3CustomerName" class="customer-name-banner"></div>
+
+        <!-- Assessment Name + Region (GLOBAL — shared across all envs) -->
+        <div class="row g-3 mb-3">
+          <div class="col-md-6">
+            <label for="assessmentNameInput" class="form-label small fw-semibold">Assessment Name: <span class="text-danger">*</span></label>
+            <input type="text" class="form-control form-control-sm" id="assessmentNameInput" placeholder="e.g., AllianceBank-2026" required>
+            <div class="invalid-feedback">Please enter an Assessment Name before running.</div>
+          </div>
+          <div class="col-md-6">
+            <label for="targetRegionSelect" class="form-label small fw-semibold">Target Region:</label>
+            <select class="form-select form-select-sm" id="targetRegionSelect">
+              <option value="southeastasia" selected>Southeast Asia (Singapore)</option>
+              <option value="eastasia">East Asia (Hong Kong)</option>
+              <option value="australiaeast">Australia East (Sydney)</option>
+              <option value="japaneast">Japan East (Tokyo)</option>
+              <option value="centralindia">Central India (Pune)</option>
+              <option value="uksouth">UK South (London)</option>
+              <option value="northeurope">North Europe (Ireland)</option>
+              <option value="westeurope">West Europe (Netherlands)</option>
+              <option value="centralus">Central US (Iowa)</option>
+              <option value="eastus">East US (Virginia)</option>
+              <option value="eastus2">East US 2 (Virginia)</option>
+              <option value="westus2">West US 2 (Washington)</option>
+              <option value="koreacentral">Korea Central (Seoul)</option>
+              <option value="malaysiawest">Malaysia West (Kuala Lumpur)</option>
+            </select>
+            <span id="regionCacheStatus" class="text-muted small"></span>
+          </div>
+        </div>
+
+        <!-- Environment Tabs (dynamically populated by JS) -->
+        <ul class="nav nav-tabs" id="envTabs" role="tablist"></ul>
+        <div class="tab-content" id="envTabContent"></div>
+
+        <!-- Global Progress (shown during multi-env assessment) -->
+        <div id="globalAssessProgress" class="hidden mt-3">
+          <div class="d-flex justify-content-between small mb-1">
+            <span id="globalProgressText">Preparing...</span>
+            <span id="globalProgressStep"></span>
+          </div>
+          <div class="progress" style="height:24px;">
+            <div id="globalProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%"></div>
+          </div>
+        </div>
+
+        <div id="assessmentError" class="alert alert-danger hidden mt-3"></div>
+
+        <div id="llmOptToggleContainer" class="mt-3 hidden">
+          <div class="form-check form-switch d-flex align-items-center gap-2">
+            <input class="form-check-input" type="checkbox" id="llmOptToggle" checked>
+            <label class="form-check-label" for="llmOptToggle">
+              <strong>AI Optimization</strong>
+              <span class="text-muted small ms-1">(LLM optimization takes time &mdash; turn off to execute fast)</span>
+            </label>
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-primary" id="runAssessmentBtn">
+            <i class="bi bi-bar-chart-line"></i> Run Assessment
+          </button>
+        </div>
+
+        <!-- Combined Total (shown after all envs complete) -->
+        <div id="combinedTotalBar" class="combined-total-bar hidden mt-4">
+          <div class="total-item"><div class="total-value" id="combinedCompute">USD 0</div><div class="total-label">Combined Compute/mo</div></div>
+          <div class="total-item"><div class="total-value" id="combinedStorage">USD 0</div><div class="total-label">Combined Storage/mo</div></div>
+          <div class="total-item"><div class="total-value" id="combinedSecurity">USD 0</div><div class="total-label">Combined Security/mo</div></div>
+          <div class="total-item"><div class="total-value" id="combinedTotal">USD 0</div><div class="total-label">TOTAL Monthly</div></div>
+        </div>
+        <div id="envPricingSummary3" class="hidden mt-3"></div>
+
+        <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+          <button class="btn btn-outline-secondary btn-sm" id="backToStep2"><i class="bi bi-arrow-left"></i> Back</button>
+          <button class="btn btn-primary btn-sm hidden" id="proceedToResults">Next: View Detailed Result <i class="bi bi-arrow-right"></i></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 4: Assessment Results -->
+    <section id="step4" class="card shadow-sm mb-4 panel hidden">
+      <div class="card-body p-4">
+        <h4 class="card-title mb-1">Step 4: Assessment Report</h4>
+        <div class="customer-name-banner" id="step4CustomerName"></div>
+
+        <!-- Summary Cards -->
+        <div id="assessSummaryCards" class="row g-3 mb-4"></div>
+
+        <!-- Cost Breakdown -->
+        <div id="assessCostBreakdown" class="mb-4"></div>
+
+        <!-- Per-Environment Pricing Config -->
+        <div id="envPricingSummary4" class="mb-4"></div>
+
+        <!-- Detailed Server Table -->
+        <div class="mb-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="fw-semibold mb-0">Server-Level Recommendations</h6>
+            <div class="d-flex gap-2">
+              <button class="btn btn-outline-secondary btn-sm" id="copyAssessTableBtn"><i class="bi bi-clipboard"></i> Copy</button>
+              <button class="btn btn-success btn-sm" id="downloadAssessExcel"><i class="bi bi-download"></i> Export Full Report (Excel)</button>
+            </div>
+          </div>
+          <div class="table-responsive border rounded" style="max-height:500px;overflow:auto;">
+            <table id="assessDetailTable" class="table table-sm table-hover table-striped mb-0 small">
+              <thead class="table-dark sticky-top"></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+          <button class="btn btn-outline-secondary btn-sm" id="backToStep3"><i class="bi bi-arrow-left"></i> Back</button>
+          <button class="btn btn-primary btn-sm hidden" id="proceedToAssessmentUpload">Next: LZ &amp; BCDR <i class="bi bi-arrow-right"></i></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 5: LZ & BCDR -->
+    <section id="step5" class="card shadow-sm mb-4 panel hidden">
+      <div class="card-body p-4">
+        <h4 class="card-title mb-1">Step 5: Landing Zone &amp; BCDR</h4>
+        <div class="customer-name-banner" id="step5CustomerName"></div>
+        <p class="text-muted small mb-3">Configure Landing Zone networking and BCDR costs. Prices are fetched from Azure; all fields are editable.</p>
+
+        <!-- Networking Egress -->
+        <div class="card bg-light mb-3">
+          <div class="card-body p-3">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <h6 class="fw-semibold mb-0"><i class="bi bi-arrow-up-right"></i> Networking Egress</h6>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="egressEnabled" checked>
+                <label class="form-check-label small" for="egressEnabled">Include Egress</label>
+              </div>
+            </div>
+            <div id="egressControls">
+              <div class="row g-3 align-items-end">
+                <div class="col-md-3">
+                  <label class="form-label small fw-semibold mb-1">Estimate Method:</label>
+                  <select class="form-select form-select-sm" id="egressMethod">
+                    <option value="per_server" selected>Per-server benchmark</option>
+                    <option value="fixed">Fixed monthly total</option>
+                  </select>
+                </div>
+                <div class="col-md-3" id="egressPerServerGroup">
+                  <label class="form-label small fw-semibold mb-1">GB/server/month:</label>
+                  <input type="number" class="form-control form-control-sm" id="egressPerServer" value="5" min="0">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label small fw-semibold mb-1" id="egressTotalLabel">Total Egress (GB/mo):</label>
+                  <input type="number" class="form-control form-control-sm" id="egressTotalGB" min="0">
+                </div>
+                <div class="col-md-3 text-end">
+                  <span class="badge bg-primary fs-6" id="egressCostBadge">USD 0.00</span>
+                </div>
+              </div>
+              <div class="text-muted small mt-1" id="egressRateInfo">Rate: $0.087/GB (fetching...)</div>
+              <div class="text-muted small mt-1" id="egressCalcInfo"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Landing Zone Components -->
+        <div class="card bg-light mb-3">
+          <div class="card-body p-3">
+            <h6 class="fw-semibold mb-2"><i class="bi bi-building"></i> Landing Zone Components</h6>
+            <div class="table-responsive">
+              <table class="table table-sm mb-0 align-middle">
+                <thead class="table-light"><tr><th>Component</th><th>SKU</th><th style="width:100px;">Qty</th><th class="text-end" style="width:140px;">Monthly Cost</th><th style="width:60px;"></th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>Azure Firewall</td>
+                    <td><select class="form-select form-select-sm lz-sku-select" id="lz_firewall_sku"></select></td>
+                    <td><input type="number" class="form-control form-control-sm" id="lz_firewall_qty" value="1" min="0"></td>
+                    <td class="text-end"><strong id="lz_firewall_cost">0.00</strong></td>
+                    <td><input type="checkbox" class="form-check-input lz-enable" id="lz_firewall_on" checked></td>
+                  </tr>
+                  <tr>
+                    <td>VPN Gateway</td>
+                    <td><select class="form-select form-select-sm lz-sku-select" id="lz_vpn_sku"></select></td>
+                    <td><input type="number" class="form-control form-control-sm" id="lz_vpn_qty" value="0" min="0"></td>
+                    <td class="text-end"><strong id="lz_vpn_cost">0.00</strong></td>
+                    <td><input type="checkbox" class="form-check-input lz-enable" id="lz_vpn_on"></td>
+                  </tr>
+                  <tr>
+                    <td>ExpressRoute</td>
+                    <td><select class="form-select form-select-sm lz-sku-select" id="lz_er_sku"></select></td>
+                    <td><input type="number" class="form-control form-control-sm" id="lz_er_qty" value="0" min="0"></td>
+                    <td class="text-end"><strong id="lz_er_cost">0.00</strong></td>
+                    <td><input type="checkbox" class="form-check-input lz-enable" id="lz_er_on"></td>
+                  </tr>
+                  <tr>
+                    <td>Azure Bastion</td>
+                    <td><select class="form-select form-select-sm lz-sku-select" id="lz_bastion_sku"></select></td>
+                    <td><input type="number" class="form-control form-control-sm" id="lz_bastion_qty" value="0" min="0"></td>
+                    <td class="text-end"><strong id="lz_bastion_cost">0.00</strong></td>
+                    <td><input type="checkbox" class="form-check-input lz-enable" id="lz_bastion_on"></td>
+                  </tr>
+                  <tr>
+                    <td>Azure Monitor / Log Analytics</td>
+                    <td><select class="form-select form-select-sm lz-sku-select" id="lz_monitor_sku"></select></td>
+                    <td><input type="number" class="form-control form-control-sm" id="lz_monitor_qty" value="0" min="0"></td>
+                    <td class="text-end"><strong id="lz_monitor_cost">0.00</strong></td>
+                    <td><input type="checkbox" class="form-check-input lz-enable" id="lz_monitor_on"></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="text-end mt-2"><span class="fw-semibold">LZ Total: <span id="lzComponentsTotal" class="text-primary">USD 0.00</span></span></div>
+          </div>
+        </div>
+
+        <!-- BCDR -->
+        <div class="card bg-light mb-3">
+          <div class="card-body p-3">
+            <h6 class="fw-semibold mb-2"><i class="bi bi-shield-check"></i> BCDR (Backup &amp; Disaster Recovery)</h6>
+
+            <!-- Backup -->
+            <div class="border rounded p-3 mb-3 bg-white">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong class="small">Azure Backup</strong>
+                <span class="badge bg-success" id="backupCostBadge">USD 0.00/mo</span>
+              </div>
+              <div class="row g-2 mb-2">
+                <div class="col-md-4">
+                  <label class="form-label small mb-0">Environments to Backup:</label>
+                  <div id="backupEnvCheckboxes" class="d-flex flex-wrap gap-1 mt-1"></div>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label small mb-0">Retention:</label>
+                  <select class="form-select form-select-sm" id="backupRetention">
+                    <option value="30_days" selected>30 days (1.5×)</option>
+                    <option value="90_days">90 days (2×)</option>
+                    <option value="1_year">1 year (3×)</option>
+                  </select>
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label small mb-0">Redundancy:</label>
+                  <select class="form-select form-select-sm" id="backupRedundancy">
+                    <option value="lrs" selected>LRS</option>
+                    <option value="grs">GRS</option>
+                  </select>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label small mb-0">Daily Change Rate %:</label>
+                  <input type="number" class="form-control form-control-sm" id="backupChangeRate" value="3" min="1" max="50">
+                </div>
+              </div>
+              <div class="text-muted small" id="backupCalcInfo">Calculating...</div>
+            </div>
+
+            <!-- ASR -->
+            <div class="border rounded p-3 bg-white">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong class="small">Azure Site Recovery (ASR)</strong>
+                <span class="badge bg-success" id="asrCostBadge">USD 0.00/mo</span>
+              </div>
+              <div class="row g-2">
+                <div class="col-md-6">
+                  <label class="form-label small mb-0">Environments for DR:</label>
+                  <div id="asrEnvCheckboxes" class="d-flex flex-wrap gap-1 mt-1"></div>
+                </div>
+                <div class="col-md-6">
+                  <div class="text-muted small" id="asrCalcInfo">Select environments to protect with ASR.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Total -->
+        <div class="combined-total-bar">
+          <div class="total-item"><div class="total-value" id="step5EgressTotal">USD 0</div><div class="total-label">Egress</div></div>
+          <div class="total-item"><div class="total-value" id="step5LZTotal">USD 0</div><div class="total-label">Landing Zone</div></div>
+          <div class="total-item"><div class="total-value" id="step5BackupTotal">USD 0</div><div class="total-label">Backup</div></div>
+          <div class="total-item"><div class="total-value" id="step5ASRTotal">USD 0</div><div class="total-label">Site Recovery</div></div>
+          <div class="total-item"><div class="total-value" id="step5GrandTotal">USD 0</div><div class="total-label">STEP 5 TOTAL</div></div>
+        </div>
+
+        <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+          <button class="btn btn-outline-secondary btn-sm" id="backToStep4"><i class="bi bi-arrow-left"></i> Back</button>
+          <button class="btn btn-primary btn-sm" id="proceedToStep6">Next: BOM <i class="bi bi-arrow-right"></i></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 6: BOM -->
+    <section id="step6" class="card shadow-sm mb-4 panel hidden">
+      <div class="card-body p-4">
+        <div class="d-flex justify-content-between align-items-start mb-1">
+          <h4 class="card-title mb-0">Step 6: Bill of Materials (BOM)</h4>
+          <div class="d-flex gap-2">
+            <button class="btn btn-outline-secondary btn-sm" id="copyBOMBtn"><i class="bi bi-clipboard"></i> Copy</button>
+            <button class="btn btn-success btn-sm" id="downloadBOMExcel"><i class="bi bi-download"></i> Export BOM (Excel)</button>
+          </div>
+        </div>
+        <div class="customer-name-banner" id="step6CustomerName"></div>
+        <div class="customer-name-banner" id="step6Region"></div>
+        <p class="text-muted small mb-3">Combined view of all costs. Values are pre-filled from assessment + Step 5. Editable where applicable.</p>
+
+        <div class="bom-cost-table-wrapper">
+          <table id="bomCostTable" class="table table-bordered bom-cost-table mb-0">
+            <thead class="table-primary">
+              <tr><th>Items</th><th class="text-end" style="width:200px;">Cost per Month (USD)</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Compute <span class="text-muted small" id="bom_computeInfo"></span></td><td><input type="number" step="0.01" id="bom_compute" class="form-control form-control-sm bom-input"></td></tr>
+              <tr><td>Managed Disks <span class="text-muted small" id="bom_storageInfo"></span></td><td><input type="number" step="0.01" id="bom_storage" class="form-control form-control-sm bom-input"></td></tr>
+              <tr><td>Defender for Servers P2 <span class="text-muted small" id="bom_securityInfo"></span></td><td><input type="number" step="0.01" id="bom_security" class="form-control form-control-sm bom-input"></td></tr>
+
+              <tr class="bom-section-header"><td colspan="2"><strong>Landing Zone</strong></td></tr>
+              <tr><td class="bom-sub-item">Azure Firewall <span class="text-muted small" id="bom_firewall_sku_label"></span></td><td class="text-end"><span id="bom_firewall_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">VPN Gateway <span class="text-muted small" id="bom_vpn_sku_label"></span></td><td class="text-end"><span id="bom_vpn_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">ExpressRoute <span class="text-muted small" id="bom_er_sku_label"></span></td><td class="text-end"><span id="bom_er_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">Azure Bastion <span class="text-muted small" id="bom_bastion_sku_label"></span></td><td class="text-end"><span id="bom_bastion_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">Azure Monitor <span class="text-muted small" id="bom_monitor_sku_label"></span></td><td class="text-end"><span id="bom_monitor_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">Network Egress <span class="text-muted small" id="bom_egress_info"></span></td><td class="text-end"><span id="bom_egress_val" class="bom-readonly">0.00</span></td></tr>
+
+              <tr class="bom-section-header"><td colspan="2"><strong>BCDR</strong></td></tr>
+              <tr><td class="bom-sub-item">Azure Backup <span class="text-muted small" id="bom_backup_info"></span></td><td class="text-end"><span id="bom_backup_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">Azure Site Recovery <span class="text-muted small" id="bom_asr_info"></span></td><td class="text-end"><span id="bom_asr_val" class="bom-readonly">0.00</span></td></tr>
+
+              <tr class="bom-section-header"><td colspan="2"><strong>License</strong></td></tr>
+              <tr><td class="bom-sub-item">Windows License &mdash; Total Cores: <span id="bom_winCores">0</span></td><td><input type="number" step="0.01" id="bom_winlicense" class="form-control form-control-sm bom-input"></td></tr>
+              <tr><td class="bom-sub-item">SQL Server License &mdash; Total Cores: <span id="bom_sqlCores">0</span></td><td><input type="number" step="0.01" id="bom_sqllicense" class="form-control form-control-sm bom-input"></td></tr>
+              <tr><td class="bom-sub-item">Linux</td><td><input type="number" step="0.01" id="bom_linuxlicense" class="form-control form-control-sm bom-input"></td></tr>
+              <tr><td class="bom-sub-item">Other Databases</td><td><input type="number" step="0.01" id="bom_otherdb" class="form-control form-control-sm bom-input"></td></tr>
+
+              <tr class="bom-total-row"><td><strong>Total Monthly Cost</strong></td><td class="text-end"><strong id="bom_totalMonthly">USD 0.00</strong></td></tr>
+              <tr class="bom-total-row"><td><strong>Total Annual Cost</strong></td><td class="text-end"><strong id="bom_totalAnnual">USD 0.00</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+          <button class="btn btn-outline-secondary btn-sm" id="backToStep5"><i class="bi bi-arrow-left"></i> Back</button>
+          <button class="btn btn-primary btn-sm" id="proceedToStep7">Next: Wave Plan <i class="bi bi-arrow-right"></i></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 7: Wave Plan -->
+    <section id="step7" class="card shadow-sm mb-4 panel hidden">
+      <div class="card-body p-4">
+        <h4 class="card-title mb-1">Step 7: Wave Plan</h4>
+        <div class="customer-name-banner" id="step7CustomerName"></div>
+
+        <!-- Wave Plan Configuration -->
+        <div id="wavePlanConfig" class="mb-3">
+          <div class="row g-3 mb-2">
+            <div class="col-md-3">
+              <label class="form-label fw-semibold small">Start Date</label>
+              <input type="date" class="form-control form-control-sm" id="wpStartDate">
+            </div>
+          </div>
+          <div class="row g-3">
+            <!-- Wave 0 group -->
+            <div class="col-md-6">
+              <div class="border rounded p-2">
+                <div class="fw-semibold small text-primary mb-2"><i class="bi bi-0-circle"></i> Wave 0 &mdash; Foundation &amp; Pilot</div>
+                <div class="row g-2">
+                  <div class="col-4">
+                    <label class="form-label small mb-1">LZ Design (wks)</label>
+                    <input type="number" class="form-control form-control-sm" id="wpLzDesign" value="4" min="1" max="12">
+                  </div>
+                  <div class="col-4">
+                    <label class="form-label small mb-1">LZ Provision (wks)</label>
+                    <input type="number" class="form-control form-control-sm" id="wpLzProvision" value="2" min="1" max="8">
+                  </div>
+                  <div class="col-4">
+                    <label class="form-label small mb-1">Pilot Duration (wks)</label>
+                    <input type="number" class="form-control form-control-sm" id="wpPilotDuration" value="8" min="1" max="12">
+                  </div>
+                </div>
+              </div>
+            </div>
+            <!-- Additional Waves group -->
+            <div class="col-md-6">
+              <div class="border rounded p-2">
+                <div class="fw-semibold small text-primary mb-2"><i class="bi bi-layers"></i> Additional Waves Settings</div>
+                <div class="row g-2">
+                  <div class="col-4">
+                    <label class="form-label small mb-1">Waves</label>
+                    <input type="number" class="form-control form-control-sm" id="wpNumWaves" value="3" min="1" max="10">
+                  </div>
+                  <div class="col-4">
+                    <label class="form-label small mb-1">Wave Duration (wks)</label>
+                    <input type="number" class="form-control form-control-sm" id="wpWaveDuration" value="2" min="1" max="8">
+                  </div>
+                  <div class="col-4">
+                    <label class="form-label small mb-1">Buffer (days)</label>
+                    <input type="number" class="form-control form-control-sm" id="wpBuffer" value="3" min="0" max="14">
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Throughput Configuration (collapsible advanced) -->
+        <div class="mb-3">
+          <a class="small text-muted text-decoration-none" data-bs-toggle="collapse" href="#wpThroughputSection" role="button">
+            <i class="bi bi-gear"></i> Migration Throughput (advanced) <i class="bi bi-chevron-down"></i>
+          </a>
+          <div class="collapse mt-2" id="wpThroughputSection">
+            <div class="row g-3 p-2 bg-light border rounded">
+              <div class="col-md-4">
+                <label class="form-label fw-semibold small">Pilot Throughput (VMs/week)</label>
+                <input type="number" class="form-control form-control-sm" id="wpPilotThroughput" value="10" min="1" max="100">
+                <div class="form-text" style="font-size:10px;">Careful migration with validation/rollback testing</div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label fw-semibold small">Wave Throughput (VMs/week)</label>
+                <input type="number" class="form-control form-control-sm" id="wpWaveThroughput" value="30" min="1" max="200">
+                <div class="form-text" style="font-size:10px;">Production waves with validated process</div>
+              </div>
+              <div class="col-md-4">
+                <div class="small mt-4 pt-1" id="wpCapacitySummary">
+                  <strong>Total capacity:</strong> <span id="wpTotalCapacity">—</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pilot & Capacity Guidance -->
+        <div id="wpPilotGuidance" class="alert alert-light border py-2 small mb-3 hidden">
+          <i class="bi bi-info-circle"></i> <span id="wpPilotInfo"></span>
+        </div>
+
+        <!-- Grouping & Generate -->
+        <div class="row g-3 mb-3 align-items-end">
+          <div class="col-md-5">
+            <label class="form-label fw-semibold small">Distribute Servers By</label>
+            <select class="form-select form-select-sm" id="wpGroupBy">
+              <option value="">Loading...</option>
+            </select>
+          </div>
+          <div class="col-md-7 d-flex justify-content-end">
+            <button class="btn btn-primary btn-sm px-4" id="wpGenerateBtn"><i class="bi bi-play-fill"></i> Generate Wave Plan</button>
+          </div>
+        </div>
+
+        <!-- LLM Instructions (full width, gradient border) -->
+        <div class="mb-3" id="wpLlmInstructionBox" style="padding:2px; border-radius:8px; background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); opacity:0.5;">
+          <div style="background:#fff; border-radius:6px; padding:10px 12px;">
+            <label class="form-label fw-semibold small mb-1 d-flex align-items-center gap-1">
+              <i class="bi bi-stars text-primary"></i> AI Instructions (optional — enhances wave assignment when AI is connected)
+              <span id="wpLlmStatusBadge" class="badge bg-secondary ms-2" style="font-size:10px;">AI not connected</span>
+            </label>
+            <textarea class="form-control form-control-sm" id="wpUserInstructions" rows="2" disabled placeholder="Connect AI in settings to enable. Type instructions like: Keep SAP servers together, migrate dev/test first, SWIFT must go last..."></textarea>
+            <div class="form-text text-muted mt-1" style="font-size:11px;"><i class="bi bi-info-circle"></i> If AI is connected and you provide instructions here, the wave assignment will use AI instead of rules. Leave empty to use rule-based assignment.</div>
+          </div>
+        </div>
+
+        <!-- Status -->
+        <div id="wpStatus" class="alert py-2 small hidden"></div>
+
+        <!-- Timeline Visualization -->
+        <div id="wpTimeline" class="hidden">
+          <h6 class="fw-bold mb-3"><i class="bi bi-calendar3"></i> Migration Timeline</h6>
+          <div class="table-responsive">
+            <table class="table table-sm table-bordered align-middle" id="wpTimelineTable">
+              <thead class="table-light">
+                <tr>
+                  <th style="width:140px">Wave</th>
+                  <th style="width:100px">Start</th>
+                  <th style="width:100px">End</th>
+                  <th>Scope</th>
+                  <th style="width:150px">AI Insight</th>
+                  <th style="width:60px">VMs</th>
+                  <th style="width:110px">Wave Cost/mo</th>
+                  <th style="width:130px">Cumulative/mo</th>
+                </tr>
+              </thead>
+              <tbody id="wpTimelineBody"></tbody>
+            </table>
+          </div>
+
+          <!-- Gantt-style bar chart -->
+          <div class="mt-3 mb-3" id="wpGanttContainer">
+            <div class="small text-muted mb-1 fw-semibold">Timeline (weeks)</div>
+            <div id="wpGantt" style="position:relative; overflow-x:auto;"></div>
+          </div>
+
+          <!-- Wave Details (expandable) -->
+          <div id="wpWaveDetails" class="accordion accordion-flush border rounded mb-3"></div>
+
+          <!-- BOM Match Check -->
+          <div id="wpCostCheck" class="alert py-2 small hidden"></div>
+        </div>
+
+        <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+          <button class="btn btn-outline-secondary btn-sm" id="backToStep6"><i class="bi bi-arrow-left"></i> Back</button>
+          <div class="hidden" id="wpExportBtns">
+            <button class="btn btn-success btn-sm me-2" id="wpExportBtn"><i class="bi bi-file-earmark-spreadsheet"></i> Download Wave Plan (.xlsx)</button>
+            <button class="btn btn-outline-primary btn-sm" id="wpExportGanttBtn"><i class="bi bi-image"></i> Download Gantt (PNG)</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="copyToast" class="toast-notification hidden">Copied to clipboard!</div>
+
+  <footer class="text-center py-3 mt-4 border-top" style="font-size:0.8rem; background-color: #f8f9fa; color: #333;">
+    Created By Mohammad Faiz (mofaiz@microsoft.com)
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
+

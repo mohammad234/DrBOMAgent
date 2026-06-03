@@ -1,0 +1,37 @@
+{
+  "defaults": {
+    "lzDesignWeeks": 4,
+    "lzProvisionWeeks": 2,
+    "numMigrationWaves": 3,
+    "waveDurationWeeks": 2,
+    "bufferDays": 3,
+    "startDateOffsetDays": 7,
+    "pilotInWave0": true,
+    "pilotCriteria": "lowest-criticality",
+    "pilotMaxGroups": 3,
+    "pilotDurationWeeks": 8,
+    "pilotThroughputPerWeek": 10,
+    "waveThroughputPerWeek": 30
+  },
+  "ui": {
+    "minWaves": 1,
+    "maxWaves": 10,
+    "minDurationWeeks": 1,
+    "maxDurationWeeks": 8,
+    "minLzDesignWeeks": 1,
+    "maxLzDesignWeeks": 12,
+    "minLzProvisionWeeks": 1,
+    "maxLzProvisionWeeks": 8
+  },
+  "groupingModes": [
+    { "id": "application", "label": "Application / Workload", "columnPatterns": ["Application", "App Name", "App Group", "Workload", "App", "Application Name", "System"] },
+    { "id": "tier", "label": "Tier", "columnPatterns": ["Tier", "App Tier", "Server Tier", "Classification"] },
+    { "id": "environment", "label": "Environment", "columnPatterns": ["Environment", "Env", "Env Type"] },
+    { "id": "criticality", "label": "Criticality / Risk", "columnPatterns": ["Criticality", "Risk", "Priority", "Business Criticality"] }
+  ],
+  "costFields": {
+    "perServer": ["computeMonthlyCost", "storageMonthlyCost"],
+    "securityPerServer": "securityMonthlyCost",
+    "note": "Cumulative monthly recurring cost once wave VMs are live in Azure"
+  }
+}

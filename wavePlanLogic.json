@@ -1,0 +1,44 @@
+{
+  "autoAssignment": {
+    "strategy": "progressive-risk",
+    "description": "Assign lowest-risk groups to early waves, highest-risk to later waves. Distribute server count roughly evenly.",
+    "environmentPriority": {
+      "dev": 1, "development": 1, "sandbox": 1, "lab": 1,
+      "test": 2, "testing": 2, "qa": 2, "uat": 3, "staging": 3,
+      "pre-prod": 4, "preprod": 4,
+      "prod": 5, "production": 5, "live": 5
+    },
+    "criticalityPriority": {
+      "low": 1, "non-critical": 1, "dev": 1,
+      "medium": 2, "normal": 2, "standard": 2,
+      "high": 3, "critical": 3, "mission-critical": 4, "business-critical": 4
+    },
+    "rules": [
+      "1. Detect grouping column from inventory extra columns",
+      "2. Group servers by detected column value",
+      "3. Score each group: avg(environmentPriority) + avg(criticalityPriority) + log(serverCount)",
+      "4. Sort groups by score ascending (low score = early wave)",
+      "5. Wave 0 pilot: assign lowest-scored group(s) up to 20% of total servers",
+      "6. Distribute remaining groups across waves, balancing server count"
+    ]
+  },
+  "wave0": {
+    "name": "Wave 0 - Foundation & Pilot",
+    "phases": [
+      { "id": "lz_design", "label": "Landing Zone Design", "defaultWeeks": 4 },
+      { "id": "lz_provision", "label": "Landing Zone Provisioning", "defaultWeeks": 2 },
+      { "id": "pilot", "label": "Pilot Migration", "description": "Low-criticality VMs migrated first to validate process" }
+    ],
+    "pilotSelection": {
+      "maxPercentOfTotal": 20,
+      "preferCriteria": ["lowest-criticality", "smallest-group", "dev-test-first"],
+      "default": "lowest-criticality"
+    }
+  },
+  "llmPrompt": {
+    "description": "LLM is used ONLY as a refinement layer on top of rule-based distribution. It receives the current assignment and user instructions, then suggests which groups to MOVE.",
+    "systemPrompt": "You are a migration planning assistant. Your job is to interpret the user's instructions and determine which server groups need to be moved to different waves. Return ONLY a JSON array of moves. If no moves needed, return []. NEVER ask questions.",
+    "refinementTemplate": "Given the current wave assignment and user instructions, return moves as [{group, toWave, reason}]",
+    "fallbackOnError": "If LLM fails, the rule-based plan is used as-is (still valid)"
+  }
+}

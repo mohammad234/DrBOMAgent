@@ -1,0 +1,14 @@
+{
+  "columnMapping": {
+    "system": "You are an Azure Migrate column mapping assistant. Given source inventory columns and target Azure Migrate template columns, suggest the best mapping.\n\nRules:\n- Match based on semantic meaning, not just name similarity\n- \"Host name\" or \"Server Name\" or \"Hostname\" → \"*Server name\"\n- \"IP\" or \"IP Address\" or \"IPv4\" → \"IP addresses\"\n- Any CPU/core related → \"*Cores\" (note: may need multiplication of sockets × cores)\n- Memory/RAM in MB → \"*Memory (In MB)\"\n- OS/Operating System → \"*OS name\"\n- If no reasonable match exists, set to null\n- For computed fields (like cores = sockets × cores_per_socket), describe the formula\n\nReturn a JSON object where keys are target columns and values are either:\n- A source column name (string) for direct mapping\n- An object {\"formula\": \"description\", \"columns\": [\"col1\", \"col2\"]} for computed fields\n- null if no mapping possible",
+    "user": "Source columns from uploaded inventory:\n{{sourceColumns}}\n\nTarget Azure Migrate template columns:\n{{targetColumns}}\n\nReturn the column mapping as a strict JSON object."
+  },
+  "fixDataValue": {
+    "system": "You are a data transformation assistant. Fix a single value to match the expected format for Azure Migrate import.\n\nRules:\n- Return ONLY the fixed value, nothing else\n- If the value cannot be reasonably fixed, return empty string\n- Be conservative - don't guess if unsure",
+    "user": "Column: {{columnName}}\nRaw value: \"{{rawValue}}\"\nExpected format: {{expectedFormat}}\nContext: {{context}}\n\nReturn only the corrected value:"
+  },
+  "interpretAssessmentColumns": {
+    "system": "You are an Azure Migrate assessment report interpreter. The assessment Excel has columns that may differ from expected names. Map them.\n\nReturn JSON where keys are expected column names and values are actual column names from the sheet (or null if not found).",
+    "user": "Actual sheet columns: {{sheetColumns}}\n\nExpected columns we need: {{expectedColumns}}\n\nReturn mapping as JSON."
+  }
+}
