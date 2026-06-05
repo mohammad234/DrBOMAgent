@@ -24,7 +24,7 @@
 > **Requires:** [Node.js](https://nodejs.org/) v18+ and [Git](https://git-scm.com/)
 
 ```bash
-git clone https://github.com/mohammad234/dr-bom-agent.git && cd dr-bom-agent && npm install && npm start
+git clone https://github.com/mohammad234/DrBOMAgent.git && cd DrBOMAgent && npm install && npm start
 ```
 
 The browser opens automatically at **http://localhost:3000**
@@ -40,8 +40,8 @@ That's it. It handles Node.js detection, dependency installation, and browser la
 
 ```bash
 # Clone the repository
-git clone https://github.com/mohammad234/dr-bom-agent.git
-cd dr-bom-agent
+git clone https://github.com/mohammad234/DrBOMAgent.git
+cd DrBOMAgent
 
 # Install dependencies
 npm install
@@ -257,7 +257,7 @@ The tool auto-detects grouping columns from your inventory (Application, Environ
 ## 📁 Project Structure
 
 ```
-dr-bom-agent/
+DrBOMAgent/
 ├── server.js              # Express backend — all API routes
 ├── assessment.js          # VM SKU sizing engine (Retail Prices API)
 ├── assessmentConfig.js    # VM series, pricing models, regions
