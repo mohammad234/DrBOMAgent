@@ -8,6 +8,7 @@ const state = {
   projectName: null,
   bomData: null,
   llmConfigured: false,
+  llmProviderType: null,
   azureConnected: false,
   customerName: "",
   securityPricePerServer: null,
@@ -33,6 +34,7 @@ const configPanel = document.getElementById("configPanel");
 const panelOverlay = document.getElementById("panelOverlay");
 
 document.getElementById("openConfigPanel").addEventListener("click", () => openPanel());
+document.getElementById("aiConnectionPill")?.addEventListener("click", () => openPanel());
 document.getElementById("closeConfigPanel").addEventListener("click", () => closePanel());
 panelOverlay.addEventListener("click", () => closePanel());
 
@@ -70,11 +72,44 @@ function closePanel() {
     const llmRes = await fetch("/api/llm/status");
     const llmStatus = await llmRes.json();
     if (llmStatus && llmStatus.configured) {
-      state.llmConfigured = true;
-      const llmOptContainer = document.getElementById("llmOptToggleContainer");
-      const llmOptToggle = document.getElementById("llmOptToggle");
-      if (llmOptContainer) llmOptContainer.classList.remove("hidden");
-      if (llmOptToggle) llmOptToggle.checked = false;
+      state.llmProviderType = llmStatus.providerType;
+      const isGithub = llmStatus.providerType === "github-models";
+      if (!isGithub) {
+        // Surface the correct Azure sub-section (azure-openai vs serverless).
+        const providerSel = document.getElementById("aiProviderType");
+        if (providerSel && llmStatus.providerType && providerSel.value !== llmStatus.providerType) {
+          providerSel.value = llmStatus.providerType;
+          providerSel.dispatchEvent(new Event("change"));
+        }
+      } else {
+        // Restored GitHub Models session — make the saved state HONEST in the UI.
+        // The PAT is never echoed back from the server (security), but the user
+        // needs visible evidence that a saved token is being used.
+        const modelSel = document.getElementById("githubModelSelect");
+        if (llmStatus.deploymentName && modelSel) {
+          // If the saved model isn't already an option (e.g. came from the dynamic
+          // catalog), insert it so the selection actually shows.
+          if (!Array.from(modelSel.options).some(o => o.value === llmStatus.deploymentName)) {
+            const opt = document.createElement("option");
+            opt.value = llmStatus.deploymentName;
+            opt.textContent = llmStatus.deploymentName + " (saved)";
+            modelSel.insertBefore(opt, modelSel.firstChild);
+          }
+          modelSel.value = llmStatus.deploymentName;
+        }
+        const patInput = document.getElementById("githubPatInput");
+        if (patInput) {
+          patInput.placeholder = "•••••••• (using saved token — paste a new one to replace)";
+        }
+        const ghStatus = document.getElementById("githubConfigStatus");
+        if (ghStatus) ghStatus.innerHTML = '<i class="bi bi-check-circle text-success"></i> Connected with saved token from previous session. <button id="ghClearSavedBtn" type="button" class="btn btn-link btn-sm p-0 align-baseline" style="font-size:0.85em;">Clear saved token</button>';
+        // Wire the inline "Clear saved token" link to the existing disconnect flow.
+        const clearBtn = document.getElementById("ghClearSavedBtn");
+        if (clearBtn) clearBtn.addEventListener("click", () => document.getElementById("aiDisconnectBtn")?.click());
+        // Show the Connect button as already-connected even though PAT field is empty.
+        if (window.__githubControls) window.__githubControls.markConnected("saved", llmStatus.deploymentName);
+      }
+      setLlmConnected(true, llmStatus.providerType);
     }
   } catch (e) {
     console.log("LLM status check skipped:", e.message);
@@ -102,40 +137,177 @@ function setAzureConnected(connected) {
   }
 }
 
-function setLlmConnected(configured) {
+function setLlmConnected(configured, providerType) {
   state.llmConfigured = configured;
-  const indicator = document.getElementById("llmStatusIndicator");
+  if (providerType) state.llmProviderType = providerType;
+  const activeProvider = providerType || state.llmProviderType || document.getElementById("aiProviderType")?.value;
+  const isGithub = activeProvider === "github-models";
+  const azureIndicator = document.getElementById("llmStatusIndicator");
+  const githubIndicator = document.getElementById("githubStatusIndicator");
+  const azureBadge = document.getElementById("azureActiveBadge");
+  const githubBadge = document.getElementById("githubActiveBadge");
+  const azureStatusText = document.getElementById("llmConfigStatus");
+  const githubStatusText = document.getElementById("githubConfigStatus");
   const badge = document.getElementById("agenticModeLabel");
   const toggle = document.getElementById("aiModeToggle");
   const llmOptContainer = document.getElementById("llmOptToggleContainer");
   const llmOptToggle = document.getElementById("llmOptToggle");
-  if (configured && state.azureConnected) {
-    indicator.className = "status-indicator on"; indicator.title = "Configured";
+  // GitHub Models doesn't need Azure login; Azure providers do.
+  const allowOn = configured && (isGithub || state.azureConnected);
+
+  // Reset both indicators and badges, then light the active group only.
+  if (azureIndicator) { azureIndicator.className = "status-indicator off"; azureIndicator.title = "Not configured"; }
+  if (githubIndicator) { githubIndicator.className = "status-indicator off"; githubIndicator.title = "Not configured"; }
+  if (azureBadge) azureBadge.classList.add("hidden");
+  if (githubBadge) githubBadge.classList.add("hidden");
+
+  if (allowOn) {
+    const targetIndicator = isGithub ? githubIndicator : azureIndicator;
+    const targetBadge = isGithub ? githubBadge : azureBadge;
+    const inactiveStatusText = isGithub ? azureStatusText : githubStatusText;
+    if (targetIndicator) { targetIndicator.className = "status-indicator on"; targetIndicator.title = "Configured"; }
+    if (targetBadge) targetBadge.classList.remove("hidden");
+    // Clear the stale "✓ Connected (…)" message on the other side so the user
+    // can tell which provider is actually live right now.
+    if (inactiveStatusText) inactiveStatusText.textContent = "";
     badge.classList.remove("hidden");
     if (toggle) toggle.checked = true;
     if (llmOptContainer) llmOptContainer.classList.remove("hidden");
     // AI Optimization defaults to OFF — user opts in explicitly because it adds latency.
     if (llmOptToggle) llmOptToggle.checked = false;
+    updateAiConnectionPill(true, isGithub ? "GitHub Models" : (activeProvider === "serverless" ? "Foundry Serverless" : "Azure OpenAI"));
   } else {
-    indicator.className = "status-indicator off"; indicator.title = "Not configured";
     badge.classList.add("hidden");
     if (toggle) toggle.checked = false;
     if (llmOptContainer) llmOptContainer.classList.add("hidden");
     if (llmOptToggle) llmOptToggle.checked = false;
+    updateAiConnectionPill(false);
   }
+}
+
+// Update the AI connection pill in the main header. Reflects the overall LLM
+// status so the user can tell at a glance — BEFORE starting Step 1 — whether
+// AI features will run.
+function updateAiConnectionPill(connected, providerLabel) {
+  const pill = document.getElementById("aiConnectionPill");
+  if (!pill) return;
+  const label = pill.querySelector(".ai-pill-label");
+  if (connected) {
+    pill.classList.add("connected");
+    if (label) label.textContent = providerLabel ? `AI: ${providerLabel}` : "AI: Connected";
+    pill.title = "AI is connected. Click to open Setup.";
+  } else {
+    pill.classList.remove("connected");
+    if (label) label.textContent = "AI: Not connected";
+    pill.title = "AI is not connected. Click to open Setup.";
+  }
+}
+
+// Reset the GitHub Models card to a clean idle state. Used when the user switches
+// to Azure — the server has already wiped the saved PAT, so the UI must follow.
+function clearGithubAiUi() {
+  const pat = document.getElementById("githubPatInput");
+  if (pat) { pat.value = ""; pat.placeholder = "ghp_\u2026 (with models:read scope)"; delete pat.dataset.savedTokenInUse; }
+  const sel = document.getElementById("githubModelSelect");
+  if (sel) {
+    // Drop any dynamically injected "(saved)" option so the dropdown reverts to defaults.
+    Array.from(sel.options).forEach(o => { if (/\(saved\)$/.test(o.textContent)) o.remove(); });
+    if (sel.options.length) sel.selectedIndex = 0;
+  }
+  const status = document.getElementById("githubConfigStatus");
+  if (status) status.textContent = "";
+  if (window.__githubControls) window.__githubControls.markDisconnected();
+}
+
+// Reset just the AI sub-section of the Azure card (keep login + subscription intact —
+// those are still valid sessions). Used when the user switches to GitHub Models.
+function clearAzureAiUi() {
+  const accSel = document.getElementById("openaiAccountSelect");
+  if (accSel) accSel.selectedIndex = 0;
+  const depSel = document.getElementById("openaiDeploymentSelect");
+  if (depSel) { depSel.innerHTML = '<option value="">-- Select Deployment --</option>'; depSel.disabled = true; }
+  const slSel = document.getElementById("serverlessEndpointSelect");
+  if (slSel) { slSel.innerHTML = '<option value="">-- Select Model --</option>'; slSel.disabled = true; }
+  const slKey = document.getElementById("serverlessApiKey");
+  if (slKey) slKey.value = "";
+  const status = document.getElementById("llmConfigStatus");
+  if (status) status.textContent = "";
 }
 
 // AI Mode toggle — allows user to disable AI without removing config
 document.getElementById("aiModeToggle").addEventListener("change", (e) => {
   state.llmConfigured = e.target.checked;
   const badge = document.getElementById("agenticModeLabel");
-  const indicator = document.getElementById("llmStatusIndicator");
+  const isGithub = state.llmProviderType === "github-models";
+  const indicator = document.getElementById(isGithub ? "githubStatusIndicator" : "llmStatusIndicator");
   if (e.target.checked) {
     badge.querySelector("span").innerHTML = '<i class="bi bi-lightning"></i> AI Mode: ON';
-    indicator.className = "status-indicator on"; indicator.title = "Configured";
+    if (indicator) { indicator.className = "status-indicator on"; indicator.title = "Configured"; }
+    updateAiConnectionPill(true, isGithub ? "GitHub Models" : (state.llmProviderType === "serverless" ? "Foundry Serverless" : "Azure OpenAI"));
   } else {
     badge.querySelector("span").innerHTML = '<i class="bi bi-lightning"></i> AI Mode: OFF';
-    indicator.className = "status-indicator off"; indicator.title = "Disabled by user";
+    if (indicator) { indicator.className = "status-indicator off"; indicator.title = "Disabled by user"; }
+    updateAiConnectionPill(false);
+  }
+});
+
+// Disconnect AI: clear server-side LLM config so the user can switch providers
+// (or just remove credentials) without re-configuring the other side first.
+document.getElementById("aiDisconnectBtn")?.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const btn = e.currentTarget;
+  btn.disabled = true; btn.textContent = "Disconnecting…";
+  try {
+    await fetch("/api/llm/disconnect", { method: "POST" });
+    // Wipe local state + UI hints so it really looks disconnected.
+    state.llmProviderType = null;
+    document.getElementById("githubPatInput").value = "";
+    document.getElementById("llmConfigStatus").textContent = "";
+    document.getElementById("githubConfigStatus").textContent = "Disconnected. Configure a provider to enable AI.";
+    if (window.__githubControls) window.__githubControls.markDisconnected();
+    setLlmConnected(false);
+  } catch (err) {
+    document.getElementById("githubConfigStatus").textContent = "Disconnect failed: " + err.message;
+  } finally {
+    btn.disabled = false; btn.textContent = "Disconnect";
+  }
+});
+
+// Re-test connection: hit the provider with a tiny ping. On failure the server
+// auto-clears the bad credentials, so we also reset the UI to a clean state.
+document.getElementById("aiRetestBtn")?.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const btn = e.currentTarget;
+  const resultEl = document.getElementById("aiRetestResult");
+  btn.disabled = true; btn.textContent = "Testing…";
+  if (resultEl) { resultEl.className = "small mt-1 text-white-50"; resultEl.style.fontSize = "0.78em"; resultEl.textContent = "Pinging provider…"; }
+  try {
+    const res = await fetch("/api/llm/retest", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      if (resultEl) { resultEl.className = "small mt-1 text-success"; resultEl.style.fontSize = "0.78em"; resultEl.textContent = `\u2713 ${data.providerType} is responding`; }
+      setTimeout(() => { if (resultEl) resultEl.classList.add("hidden"); }, 4000);
+    } else {
+      // Server already cleared the bad config — sync the UI to match.
+      if (resultEl) {
+        resultEl.className = "small mt-1 text-warning";
+        resultEl.style.fontSize = "0.78em";
+        const statusBit = data.status ? ` (HTTP ${data.status})` : "";
+        resultEl.textContent = `\u2717 Re-test failed${statusBit}: ${data.error || "no response"}. Credentials cleared — please reconnect.`;
+        resultEl.classList.remove("hidden");
+      }
+      state.llmProviderType = null;
+      document.getElementById("githubPatInput").value = "";
+      document.getElementById("githubPatInput").placeholder = "ghp_… (with models:read scope)";
+      document.getElementById("githubConfigStatus").textContent = "";
+      document.getElementById("llmConfigStatus").textContent = "";
+      if (window.__githubControls) window.__githubControls.markDisconnected();
+      setLlmConnected(false);
+    }
+  } catch (err) {
+    if (resultEl) { resultEl.className = "small mt-1 text-warning"; resultEl.style.fontSize = "0.78em"; resultEl.textContent = "Re-test request failed: " + err.message; resultEl.classList.remove("hidden"); }
+  } finally {
+    btn.disabled = false; btn.textContent = "Re-test";
   }
 });
 
@@ -245,16 +417,156 @@ document.getElementById("openaiAccountSelect").addEventListener("change", async 
   } catch (e) { depSel.innerHTML = `<option value="">Error: ${e.message}</option>`; }
 });
 
-// Provider type toggle
+// Provider type toggle (Azure AI card: openai vs serverless only — GitHub Models is its own group)
 document.getElementById("aiProviderType").addEventListener("change", (e) => {
-  const isServerless = e.target.value === "serverless";
+  const v = e.target.value;
+  const isServerless = v === "serverless";
   document.getElementById("azureOpenAISection").classList.toggle("hidden", isServerless);
   document.getElementById("serverlessSection").classList.toggle("hidden", !isServerless);
-  setLlmConnected(false);
+  // Switching the Azure sub-provider only blanks the Azure side; GitHub stays as-is.
+  if (state.llmProviderType !== "github-models") setLlmConnected(false, v);
   document.getElementById("llmConfigStatus").textContent = "";
-  // Load serverless endpoints if selected
   if (isServerless && state.subscriptionId) loadServerlessEndpoints();
 });
+
+// GitHub Models: enable Connect button only when PAT + model are present.
+// Also: when the user finishes pasting the PAT, fetch the actual model catalog
+// from GitHub so the dropdown only shows models they have access to (avoids
+// the 403 "no_access" surprise on first real LLM call).
+(function wireGithubModelsControls() {
+  const pat = document.getElementById("githubPatInput");
+  const model = document.getElementById("githubModelSelect");
+  const btn = document.getElementById("githubModelsSaveBtn");
+  const status = document.getElementById("githubConfigStatus");
+  if (!pat || !model || !btn) return;
+
+  // Track what was last successfully connected so we can disable the button until
+  // the user changes the PAT or model (mirrors Azure's auto-save-then-lock pattern).
+  let connectedSnapshot = { pat: "", model: "" };
+
+  const setButtonConnected = () => {
+    btn.classList.remove("btn-primary");
+    btn.classList.add("btn-success");
+    btn.innerHTML = '<i class="bi bi-check-circle"></i> Connected';
+    btn.disabled = true;
+  };
+  const setButtonIdle = () => {
+    btn.classList.remove("btn-success");
+    btn.classList.add("btn-primary");
+    btn.textContent = "Connect GitHub Models";
+  };
+
+  const refresh = () => {
+    const hasInputs = !!pat.value.trim() && !!model.value;
+    const isUnchanged = pat.value.trim() === connectedSnapshot.pat && model.value === connectedSnapshot.model;
+    if (!hasInputs) {
+      setButtonIdle();
+      btn.disabled = true;
+      return;
+    }
+    if (isUnchanged && connectedSnapshot.pat) {
+      // Same credentials that are currently connected — show as connected, disable.
+      setButtonConnected();
+      return;
+    }
+    // New / changed credentials — back to idle and enabled.
+    setButtonIdle();
+    btn.disabled = false;
+  };
+
+  let catalogLoadedFor = null;
+
+  async function loadCatalog(p) {
+    if (!p || catalogLoadedFor === p) return;
+    status.textContent = "Loading available models…";
+    model.disabled = true;
+    try {
+      const res = await fetch("/api/llm/github-models/catalog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ githubPat: p }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        status.textContent = (data.error || "Could not load models") + " Using built-in list — pick a free-tier model to try.";
+        // Leave the hard-coded fallback list in place so the user can still try.
+        return;
+      }
+      const prevSelected = model.value;
+      model.innerHTML = "";
+      if (!data.models || data.models.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = ""; opt.textContent = "(no chat models accessible to this PAT)";
+        model.appendChild(opt);
+      } else {
+        data.models.forEach(m => {
+          const opt = document.createElement("option");
+          opt.value = m.id;
+          opt.textContent = `${m.name}${m.tier ? ` — ${m.tier} tier` : ""}`;
+          model.appendChild(opt);
+        });
+        // Preserve previous selection if still available, else pick first low-tier model.
+        if (Array.from(model.options).some(o => o.value === prevSelected)) {
+          model.value = prevSelected;
+        }
+      }
+      status.textContent = `${data.models.length} model(s) available with this PAT.`;
+      catalogLoadedFor = p;
+    } catch (err) {
+      status.textContent = "Could not load models: " + err.message;
+    } finally {
+      model.disabled = false;
+      refresh();
+    }
+  }
+
+  pat.addEventListener("input", () => { refresh(); });
+  // Trigger catalog load when PAT field loses focus (gives the user a chance to finish pasting).
+  pat.addEventListener("blur", () => loadCatalog(pat.value.trim()));
+  model.addEventListener("change", refresh);
+
+  btn.addEventListener("click", async () => {
+    const githubPat = pat.value.trim();
+    const selectedModel = model.value;
+    if (!githubPat || !selectedModel) return;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Testing & connecting…';
+    status.textContent = "";
+    try {
+      const res = await fetch("/api/llm/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerType: "github-models", githubPat, model: selectedModel }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        // Server has wiped Azure credentials — mirror that in the Azure card UI.
+        clearAzureAiUi();
+        setLlmConnected(true, "github-models");
+        status.textContent = "\u2713 Connected (GitHub Models)";
+        connectedSnapshot = { pat: githubPat, model: selectedModel };
+        setButtonConnected();
+      } else {
+        setLlmConnected(false, "github-models");
+        status.textContent = "Error: " + (data.error || "Config failed");
+        setButtonIdle();
+        btn.disabled = false;
+      }
+    } catch (err) {
+      setLlmConnected(false, "github-models");
+      status.textContent = "Error: " + err.message;
+      setButtonIdle();
+      btn.disabled = false;
+    }
+  });
+
+  // Expose a way for the boot-time status restore + disconnect handler to sync
+  // the button state with reality.
+  window.__githubControls = {
+    markConnected: (p, m) => { connectedSnapshot = { pat: p || "saved", model: m || "" }; setButtonConnected(); },
+    markDisconnected: () => { connectedSnapshot = { pat: "", model: "" }; setButtonIdle(); btn.disabled = true; },
+  };
+})();
 
 // Load serverless model endpoints
 async function loadServerlessEndpoints() {
@@ -299,7 +611,9 @@ document.getElementById("serverlessEndpointSelect").addEventListener("change", a
     });
     const data = await res.json();
     if (data.success) {
-      setLlmConnected(true);
+      // Server has wiped GitHub credentials — mirror that in the GitHub card UI.
+      clearGithubAiUi();
+      setLlmConnected(true, "serverless");
       document.getElementById("llmConfigStatus").textContent = "\u2713 Connected (Serverless)!";
     } else {
       document.getElementById("llmConfigStatus").textContent = "Error: " + (data.error || "Config failed");
@@ -336,7 +650,9 @@ document.getElementById("openaiDeploymentSelect").addEventListener("change", asy
     });
     const data = await res.json();
     if (data.success) {
-      setLlmConnected(true);
+      // Server has wiped GitHub credentials — mirror that in the GitHub card UI.
+      clearGithubAiUi();
+      setLlmConnected(true, "azure-openai");
       document.getElementById("llmConfigStatus").textContent = "\u2713 Connected!";
     } else {
       document.getElementById("llmConfigStatus").textContent = "Error: " + (data.error || "Config failed");
@@ -2499,7 +2815,7 @@ loadHistorySessions();
 //Pay as you to by hours
 //Load Wave Plan config by customer input
 //exclude certain env from TCO or Better DR planning with identifying 
-//Future Scope INtegrate in copilot
+//Future Scope Integrate in copilot
 //Assessment for VMWare migration, SAP MIgration, Citrix Machine, Desktop as a service
 //Modernizaton Scenarios and app classification Rehost, Refactor, Rearchitect, Rebuild, Replace
 //Generate wave plan always use AI with or without user instruction because it is llm optimization

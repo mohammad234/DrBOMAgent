@@ -14,106 +14,179 @@
 
   <!-- Config Panel (Right Side) -->
   <aside id="configPanel" class="config-panel">
-    <div class="config-panel-header d-flex justify-content-between align-items-center p-3 border-bottom bg-light">
-      <h5 class="mb-0"><i class="bi bi-gear"></i> Setup</h5>
-      <button id="closeConfigPanel" class="btn-close"></button>
+    <div class="config-panel-header p-3 border-bottom bg-light">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-gear"></i> Setup</h5>
+        <button id="closeConfigPanel" class="btn-close"></button>
+      </div>
+      <p class="text-muted small mb-0 mt-1">Set up how Dr. BOM uses AI.</p>
     </div>
     <div class="config-panel-body p-3 overflow-auto flex-grow-1">
 
-      <!-- 1. Azure Login -->
-      <div class="card mb-3">
-        <div class="card-body p-3">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <span class="fw-semibold small">Azure Login</span>
-            <span id="azureStatusIndicator" class="status-indicator off" title="Not connected"></span>
-          </div>
-          <div id="azureLoggedOutView">
-            <p class="text-muted small mb-2">Sign in like <code>az login</code> &mdash; no app registration needed.</p>
-            <button class="btn btn-primary btn-sm" id="azureLoginBtn"><i class="bi bi-lock"></i> Login to Azure</button>
-            <div id="deviceCodeBox" class="hidden mt-3">
-              <p class="small text-primary fw-medium">Open the link below and enter the code:</p>
-              <div class="device-code-display bg-dark rounded p-3 text-center">
-                <a id="deviceCodeLink" href="#" target="_blank" class="device-link text-info small"></a>
-                <div class="device-code-value text-warning fw-bold fs-3 mt-2 font-monospace" id="deviceCodeValue"></div>
+      <!-- ========== GROUP A: AZURE (single card with 3 sub-sections) ========== -->
+      <div class="provider-group mb-4">
+        <div class="provider-group-header d-flex align-items-center gap-2 mb-2">
+          <i class="bi bi-microsoft text-primary"></i>
+          <span class="fw-semibold">Azure</span>
+          <small class="text-muted ms-1">Login &middot; Subscription &middot; AI</small>
+          <span id="azureActiveBadge" class="active-badge ms-auto hidden">Active</span>
+        </div>
+
+        <div class="card mb-0">
+          <div class="card-body p-3">
+            <!-- Sub-section 1: Azure Login -->
+            <div class="provider-subsection">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <span class="fw-semibold small">Azure Login</span>
+                <span id="azureStatusIndicator" class="status-indicator off" title="Not connected"></span>
               </div>
-              <div id="deviceCodePolling" class="text-muted small mt-2">Waiting for you to complete sign-in...</div>
-            </div>
-            <div id="loginStatus" class="hidden mt-2"></div>
-          </div>
-          <div id="azureLoggedInView" class="hidden">
-            <div class="alert alert-success py-2 mb-0 text-center small fw-medium"><i class="bi bi-check-circle"></i> Connected to Azure</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 2. Subscription -->
-      <div class="card mb-3">
-        <div class="card-body p-3">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <span class="fw-semibold small">Azure Subscription</span>
-            <span id="subStatusIndicator" class="status-indicator off" title="Not selected"></span>
-          </div>
-          <select class="form-select form-select-sm" id="subscriptionSelect" disabled>
-            <option value="">Login to Azure first</option>
-          </select>
-        </div>
-      </div>
-
-      <!-- 3. Azure AI -->
-      <div class="card mb-3">
-        <div class="card-body p-3">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <span class="fw-semibold small">Azure AI</span>
-            <span id="llmStatusIndicator" class="status-indicator off" title="Not configured"></span>
-          </div>
-          <p class="text-muted small mb-2">Optional &mdash; enables Agentic workflow execution.</p>
-          <div class="mb-2">
-            <label class="form-label small mb-1">Provider Type:</label>
-            <select class="form-select form-select-sm" id="aiProviderType">
-              <option value="azure-openai" selected>Azure OpenAI</option>
-              <option value="serverless">Serverless Model (Foundry MaaS)</option>
-            </select>
-          </div>
-          <!-- Azure OpenAI selection -->
-          <div id="azureOpenAISection">
-            <div class="mb-2">
-              <label for="openaiAccountSelect" class="form-label small mb-1">AI Foundry Endpoint:</label>
-              <select class="form-select form-select-sm" id="openaiAccountSelect" disabled>
-                <option value="">Select subscription first</option>
-              </select>
-            </div>
-            <div class="mb-2">
-              <label for="openaiDeploymentSelect" class="form-label small mb-1">Deployment Name:</label>
-              <select class="form-select form-select-sm" id="openaiDeploymentSelect" disabled>
-                <option value="">Select endpoint first</option>
-              </select>
-            </div>
-          </div>
-          <!-- Serverless model selection -->
-          <div id="serverlessSection" class="hidden">
-            <div class="mb-2">
-              <label for="serverlessEndpointSelect" class="form-label small mb-1">Serverless Model:</label>
-              <select class="form-select form-select-sm" id="serverlessEndpointSelect" disabled>
-                <option value="">Select subscription first</option>
-              </select>
-            </div>
-            <div class="mb-2">
-              <label for="serverlessApiKey" class="form-label small mb-1">API Key (from Foundry):</label>
-              <input type="password" class="form-control form-control-sm" id="serverlessApiKey" placeholder="Enter serverless endpoint key">
-            </div>
-          </div>
-          <span id="llmConfigStatus" class="text-muted small"></span>
-          <div id="agenticModeLabel" class="agentic-badge hidden">
-            <div class="d-flex justify-content-between align-items-center">
-              <span><i class="bi bi-lightning"></i> AI Mode: ON</span>
-              <div class="form-check form-switch mb-0 ms-2">
-                <input class="form-check-input" type="checkbox" id="aiModeToggle" checked>
+              <div id="azureLoggedOutView">
+                <p class="text-muted small mb-2">Sign in like <code>az login</code> &mdash; no app registration needed.</p>
+                <button class="btn btn-primary btn-sm" id="azureLoginBtn"><i class="bi bi-lock"></i> Login to Azure</button>
+                <div id="deviceCodeBox" class="hidden mt-3">
+                  <p class="small text-primary fw-medium">Open the link below and enter the code:</p>
+                  <div class="device-code-display bg-dark rounded p-3 text-center">
+                    <a id="deviceCodeLink" href="#" target="_blank" class="device-link text-info small"></a>
+                    <div class="device-code-value text-warning fw-bold fs-3 mt-2 font-monospace" id="deviceCodeValue"></div>
+                  </div>
+                  <div id="deviceCodePolling" class="text-muted small mt-2">Waiting for you to complete sign-in...</div>
+                </div>
+                <div id="loginStatus" class="hidden mt-2"></div>
+              </div>
+              <div id="azureLoggedInView" class="hidden">
+                <div class="alert alert-success py-2 mb-0 text-center small fw-medium"><i class="bi bi-check-circle"></i> Connected to Azure</div>
               </div>
             </div>
+
+            <hr class="my-3 provider-subsection-divider">
+
+            <!-- Sub-section 2: Subscription -->
+            <div class="provider-subsection">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <span class="fw-semibold small">Azure Subscription</span>
+                <span id="subStatusIndicator" class="status-indicator off" title="Not selected"></span>
+              </div>
+              <select class="form-select form-select-sm" id="subscriptionSelect" disabled>
+                <option value="">Login to Azure first</option>
+              </select>
+            </div>
+
+            <hr class="my-3 provider-subsection-divider">
+
+            <!-- Sub-section 3: Azure AI -->
+            <div class="provider-subsection">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <span class="fw-semibold small">Azure AI</span>
+                <span id="llmStatusIndicator" class="status-indicator off" title="Not configured"></span>
+              </div>
+              <div class="mb-2">
+                <label class="form-label small mb-1">Provider Type:</label>
+                <select class="form-select form-select-sm" id="aiProviderType">
+                  <option value="azure-openai" selected>Azure OpenAI</option>
+                  <option value="serverless">Serverless Model (Foundry MaaS)</option>
+                </select>
+              </div>
+              <!-- Azure OpenAI selection -->
+              <div id="azureOpenAISection">
+                <div class="mb-2">
+                  <label for="openaiAccountSelect" class="form-label small mb-1">AI Foundry Endpoint:</label>
+                  <select class="form-select form-select-sm" id="openaiAccountSelect" disabled>
+                    <option value="">Select subscription first</option>
+                  </select>
+                </div>
+                <div class="mb-2">
+                  <label for="openaiDeploymentSelect" class="form-label small mb-1">Deployment Name:</label>
+                  <select class="form-select form-select-sm" id="openaiDeploymentSelect" disabled>
+                    <option value="">Select endpoint first</option>
+                  </select>
+                </div>
+              </div>
+              <!-- Serverless model selection -->
+              <div id="serverlessSection" class="hidden">
+                <div class="mb-2">
+                  <label for="serverlessEndpointSelect" class="form-label small mb-1">Serverless Model:</label>
+                  <select class="form-select form-select-sm" id="serverlessEndpointSelect" disabled>
+                    <option value="">Select subscription first</option>
+                  </select>
+                </div>
+                <div class="mb-2">
+                  <label for="serverlessApiKey" class="form-label small mb-1">API Key (from Foundry):</label>
+                  <input type="password" class="form-control form-control-sm" id="serverlessApiKey" placeholder="Enter serverless endpoint key">
+                </div>
+              </div>
+              <span id="llmConfigStatus" class="text-muted small"></span>
+            </div>
           </div>
         </div>
       </div>
 
+      <!-- ========== GROUP B: GITHUB MODELS (no Azure required) ========== -->
+      <div class="provider-group mb-3">
+        <div class="provider-group-header d-flex align-items-center gap-2 mb-2">
+          <i class="bi bi-github"></i>
+          <span class="fw-semibold">GitHub</span>
+          <small class="text-muted ms-1">Free, no Azure required</small>
+          <span id="githubActiveBadge" class="active-badge ms-auto hidden">Active</span>
+        </div>
+
+        <div class="card mb-0">
+          <div class="card-body p-3">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <span class="fw-semibold small">GitHub Models</span>
+              <span id="githubStatusIndicator" class="status-indicator off" title="Not configured"></span>
+            </div>
+            <p class="text-muted small mb-2">Use a free GitHub Personal Access Token. Rate limits apply.</p>
+            <div class="alert alert-info py-2 px-2 small mb-2" style="font-size:0.78em;line-height:1.35;">
+              <i class="bi bi-info-circle"></i> <strong>Heads up:</strong> OpenAI models (gpt-4o, etc.) on GitHub Models require a <a href="https://github.com/features/copilot/plans" target="_blank" rel="noopener">Copilot Pro+ subscription</a>. Free accounts can use Mistral, Llama, Phi, DeepSeek, etc.
+            </div>
+            <div id="githubModelsSection">
+              <div class="mb-2 d-flex align-items-end gap-2">
+                <div class="flex-grow-1">
+                  <label for="githubPatInput" class="form-label small mb-1">GitHub PAT (<code>models:read</code> scope):</label>
+                  <input type="password" class="form-control form-control-sm" id="githubPatInput" placeholder="github_pat_…">
+                </div>
+                <a href="https://github.com/settings/personal-access-tokens/new?description=Dr+BOM+Agent" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm" title="Open GitHub to generate a fine-grained PAT">
+                  <i class="bi bi-key"></i> Get Token
+                </a>
+              </div>
+              <div class="mb-2">
+                <label for="githubModelSelect" class="form-label small mb-1">Model:</label>
+                <select class="form-select form-select-sm" id="githubModelSelect">
+                  <optgroup label="Free tier (no Copilot needed)">
+                    <option value="mistral-ai/mistral-small-2503" selected>Mistral Small (fast, free tier)</option>
+                    <option value="mistral-ai/Mistral-Large-2411">Mistral Large</option>
+                    <option value="meta/Llama-3.3-70B-Instruct">Meta Llama 3.3 70B</option>
+                    <option value="microsoft/Phi-3.5-MoE-instruct">Microsoft Phi-3.5 MoE</option>
+                    <option value="deepseek/DeepSeek-V3-0324">DeepSeek V3</option>
+                  </optgroup>
+                  <optgroup label="Requires Copilot Pro+">
+                    <option value="openai/gpt-4o-mini">OpenAI GPT-4o mini</option>
+                    <option value="openai/gpt-4o">OpenAI GPT-4o</option>
+                    <option value="openai/gpt-5-mini">OpenAI GPT-5 mini</option>
+                  </optgroup>
+                </select>
+              </div>
+              <button id="githubModelsSaveBtn" class="btn btn-primary btn-sm w-100" disabled>Connect GitHub Models</button>
+              <span id="githubConfigStatus" class="text-muted small d-block mt-2"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Shared AI Mode badge (visible when ANY provider is connected) -->
+      <div id="agenticModeLabel" class="agentic-badge hidden">
+        <div class="d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-lightning"></i> AI Mode: ON</span>
+          <div class="d-flex align-items-center gap-2">
+            <button id="aiRetestBtn" class="btn btn-link btn-sm p-0 text-white text-decoration-underline" style="font-size:0.78em;" title="Verify the saved credentials still work">Re-test</button>
+            <button id="aiDisconnectBtn" class="btn btn-link btn-sm p-0 text-white text-decoration-underline" style="font-size:0.78em;" title="Clear AI credentials so you can configure a different provider">Disconnect</button>
+            <div class="form-check form-switch mb-0 ms-1">
+              <input class="form-check-input" type="checkbox" id="aiModeToggle" checked>
+            </div>
+          </div>
+        </div>
+        <div id="aiRetestResult" class="hidden small mt-1" style="font-size:0.78em;"></div>
+      </div>
     </div>
   </aside>
 
@@ -140,8 +213,11 @@
     <header class="text-center mb-4">
       <div class="header-top d-flex justify-content-center align-items-center position-relative">
         <button id="openHistoryBtn" class="btn btn-outline-secondary btn-sm position-absolute start-0" title="Session History"><i class="bi bi-list"></i></button>
-        <h1 class="text-primary fw-bold">Dr. BOM Agent</h1>
-        <button id="openConfigPanel" class="btn btn-primary btn-sm position-absolute end-0" title="Open Setup Panel"><i class="bi bi-gear"></i> Setup</button>
+        <h1 class="text-primary fw-bold mb-0">Dr. BOM Agent</h1>
+        <button id="aiConnectionPill" type="button" class="ai-connection-pill ms-3" title="Open Setup to configure AI">
+          <span class="ai-pill-dot"></span><span class="ai-pill-label">AI: Not connected</span>
+        </button>
+        <button id="openConfigPanel" class="btn btn-outline-secondary btn-sm position-absolute end-0" title="Open Setup Panel"><i class="bi bi-gear"></i></button>
       </div>
       <p class="text-muted small mt-1">Upload Inventory &rarr; Convert &rarr; Assess &rarr; Full BOM View</p>
     </header>
@@ -164,7 +240,7 @@
         <p class="text-muted small mb-3">Upload your server inventory CSV or Excel file. Columns will be mapped to Azure Migrate import format.</p>
         <div class="mb-3" style="max-width:400px;">
           <label for="customerNameInput" class="form-label fw-semibold">Customer Name: <span class="text-danger">*</span></label>
-          <input type="text" class="form-control" id="customerNameInput" placeholder="e.g., Alliance Bank" required>
+          <input type="text" class="form-control" id="customerNameInput"  required>
           <div class="invalid-feedback" id="customerNameFeedback">Please enter a customer name before uploading.</div>
         </div>
         <div class="upload-area" id="uploadArea">
@@ -254,7 +330,7 @@
         <div class="row g-3 mb-3">
           <div class="col-md-6">
             <label for="assessmentNameInput" class="form-label small fw-semibold">Assessment Name: <span class="text-danger">*</span></label>
-            <input type="text" class="form-control form-control-sm" id="assessmentNameInput" placeholder="e.g., AllianceBank-2026" required>
+            <input type="text" class="form-control form-control-sm" id="assessmentNameInput" required>
             <div class="invalid-feedback">Please enter an Assessment Name before running.</div>
           </div>
           <div class="col-md-6">

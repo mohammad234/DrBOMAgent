@@ -1544,22 +1544,138 @@ app.get("/api/llm/status", (req, res) => {
   res.json(llmHelper.getStatus());
 });
 
-app.post("/api/llm/config", (req, res) => {
-  const { endpoint, apiKey, deploymentName, useTokenAuth, providerType } = req.body;
-  console.log(`[LLM Config] endpoint="${endpoint}", deployment="${deploymentName}", tokenAuth=${useTokenAuth}, provider=${providerType || "auto"}`);
+app.post("/api/llm/config", async (req, res) => {
+  const { endpoint, apiKey, deploymentName, useTokenAuth, providerType, githubPat, model } = req.body;
+  console.log(`[LLM Config] provider=${providerType || "auto"}, endpoint="${endpoint || "-"}", deployment="${deploymentName || model || "-"}", tokenAuth=${useTokenAuth}`);
+
+  if (providerType === "github-models") {
+    if (!githubPat || !model) {
+      return res.status(400).json({ error: "GitHub Models requires both PAT and model." });
+    }
+    // Validate against the real API before persisting — catches 403 "no_access" up front
+    // instead of letting the user discover it later on the first real LLM call.
+    const v = await llmHelper.validateGithubModels(githubPat, model);
+    if (!v.ok) {
+      let msg;
+      if (v.status === 403 && /openai|azure-openai/i.test(model)) {
+        // OpenAI models on GitHub Models are gated behind Copilot Pro/Business/Enterprise.
+        // A Free-tier PAT will get no_access no matter how the PAT is configured.
+        msg = `GitHub denied access to ${model}. OpenAI models require a Copilot Pro+ subscription on GitHub. Try a free-tier model like mistral-ai/mistral-small-2503 or microsoft/Phi-3.5-MoE-instruct instead.`;
+      } else if (v.status === 403) {
+        msg = `GitHub denied access to ${model}. Check that your PAT has 'models:read' and that your account has access to this model. (${v.error})`;
+      } else if (v.status === 429 || (v.error && /abuse|rate limit|whoa there/i.test(v.error))) {
+        msg = "GitHub is rate-limiting requests right now. Wait a few minutes and try again.";
+      } else {
+        msg = v.error || "Validation failed";
+      }
+      return res.status(400).json({ error: msg, status: v.status });
+    }
+    llmHelper.configure({ providerType: "github-models", githubPat, model });
+    console.log(`[LLM Config] Final status:`, llmHelper.getStatus());
+    // Persist non-secret fields; we do save the PAT locally (same threat model as the existing API key).
+    saveLocalConfig({
+      providerType: "github-models",
+      githubPat,
+      model,
+      // Clear stale Azure fields so a later boot doesn't accidentally re-arm Azure on top of GitHub.
+      endpoint: "",
+      deploymentName: "",
+      useTokenAuth: false,
+      apiKey: "",
+    });
+    return res.json({ success: true, status: llmHelper.getStatus() });
+  }
+
+  // Azure paths (unchanged behavior).
   // Only require token validation for token auth mode
   if (useTokenAuth && !getToken(req)) {
     return res.status(400).json({ error: "Token auth requires Azure login first." });
   }
   llmHelper.configure({ endpoint, apiKey, deploymentName, useTokenAuth, providerType });
   console.log(`[LLM Config] Final status:`, llmHelper.getStatus());
-  saveLocalConfig({ endpoint, deploymentName, useTokenAuth: useTokenAuth || false, providerType: providerType || "auto" });
+  saveLocalConfig({
+    endpoint,
+    deploymentName,
+    useTokenAuth: useTokenAuth || false,
+    providerType: providerType || "auto",
+    // Clear GitHub-only fields when switching back to Azure.
+    githubPat: "",
+    model: "",
+  });
+  res.json({ success: true, status: llmHelper.getStatus() });
+});
+
+// GitHub Models: list available models for a given PAT (proxied so the PAT never
+// touches the browser's network log and CORS isn't a concern).
+app.post("/api/llm/github-models/catalog", async (req, res) => {
+  const { githubPat } = req.body;
+  if (!githubPat) return res.status(400).json({ error: "PAT required" });
+  const result = await llmHelper.listGithubModels(githubPat);
+  if (!result.ok) {
+    const msg = result.status === 401 ? "PAT rejected by GitHub (check the token)."
+              : result.status === 403 ? "PAT lacks 'models:read' scope."
+              : (result.error || "Failed to load models");
+    return res.status(result.status || 502).json({ error: msg });
+  }
+  res.json({ models: result.models });
+});
+
+// Disconnect AI: clear in-memory LLM config AND wipe persisted credentials so
+// the next boot doesn't auto-re-arm. User can reconfigure from scratch.
+app.post("/api/llm/disconnect", (req, res) => {
+  llmHelper.configure({ reset: true });
+  try {
+    const existing = loadLocalConfig();
+    const cleared = {
+      ...existing,
+      providerType: "",
+      endpoint: "",
+      apiKey: "",
+      deploymentName: "",
+      useTokenAuth: false,
+      githubPat: "",
+      model: "",
+    };
+    fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(cleared, null, 2), "utf-8");
+  } catch (err) {
+    console.error(`Disconnect: could not clear local config: ${err.message}`);
+  }
+  console.log("[LLM] Disconnected by user. Local config cleared.");
   res.json({ success: true, status: llmHelper.getStatus() });
 });
 
 app.get("/api/llm/saved-config", (req, res) => {
   const config = loadLocalConfig();
-  res.json({ endpoint: config.endpoint || "", deploymentName: config.deploymentName || "", useTokenAuth: config.useTokenAuth || false });
+  res.json({
+    endpoint: config.endpoint || "",
+    deploymentName: config.deploymentName || "",
+    useTokenAuth: config.useTokenAuth || false,
+    providerType: config.providerType || "",
+    // GitHub Models: surface model name and a boolean indicating a PAT is stored (never echo the PAT itself).
+    model: config.model || "",
+    hasGithubPat: !!config.githubPat,
+  });
+});
+
+// Re-test the currently configured LLM connection. On failure, automatically
+// clears the bad credentials so the user can reconfigure cleanly.
+app.post("/api/llm/retest", async (req, res) => {
+  const result = await llmHelper.validateCurrent();
+  if (!result.ok) {
+    // Token went stale at runtime — wipe so next boot doesn't auto-arm.
+    llmHelper.configure({ reset: true });
+    try {
+      const existing = loadLocalConfig();
+      const cleared = { ...existing, providerType: "", endpoint: "", apiKey: "", deploymentName: "", useTokenAuth: false, githubPat: "", model: "" };
+      fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(cleared, null, 2), "utf-8");
+    } catch (err) {
+      console.error(`Retest cleanup: could not clear local config: ${err.message}`);
+    }
+    console.log(`[LLM] Retest FAILED for ${result.providerType}: ${result.error}. Config cleared.`);
+    return res.json({ ok: false, status: result.status, error: result.error, providerType: result.providerType, cleared: true });
+  }
+  console.log(`[LLM] Retest OK for ${result.providerType}.`);
+  res.json({ ok: true, providerType: result.providerType });
 });
 
 // ============ SESSION PERSISTENCE ENDPOINTS ============
@@ -4491,11 +4607,38 @@ async function main() {
       if (config.azureClientId) AZURE_CONFIG.clientId = config.azureClientId;
       if (config.azureTenantId) AZURE_CONFIG.tenantId = config.azureTenantId;
 
-      // LLM config is saved locally but only activated when user explicitly selects endpoint+deployment
-      // (or when pre-auth restores a valid session with saved config)
-      if (config.llm && config.llm.endpoint && config.llm.apiKey) {
+      // LLM config: merge env-var config (from runSetup) with persisted .llm-config.json.
+      // Persisted config wins because the user explicitly saved it from the web panel.
+      const persistedLlm = loadLocalConfig();
+      const mergedLlm = { ...(config.llm || {}), ...persistedLlm };
+
+      if (mergedLlm.providerType === "github-models" && mergedLlm.githubPat && mergedLlm.model) {
+        // GitHub Models is fully self-contained (no Azure dependency) so it can re-arm at boot.
+        // But: tokens can expire, be revoked, or lose model access between sessions. Revalidate
+        // with a tiny 1-token call before arming, so the UI never shows a misleading "Connected"
+        // state for a token that no longer works.
+        const v = await llmHelper.validateGithubModels(mergedLlm.githubPat, mergedLlm.model);
+        if (v.ok) {
+          llmHelper.configure({
+            providerType: "github-models",
+            githubPat: mergedLlm.githubPat,
+            model: mergedLlm.model,
+          });
+          console.log(`  ✓ AI/LLM configured (GitHub Models, model=${mergedLlm.model})\n`);
+        } else {
+          // Wipe the dead config from disk so the next boot doesn't keep retrying it.
+          try {
+            const existing = loadLocalConfig();
+            fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify({
+              ...existing,
+              providerType: "", githubPat: "", model: "",
+            }, null, 2), "utf-8");
+          } catch {}
+          console.log(`  ✗ Saved GitHub Models token rejected (HTTP ${v.status || "?"}: ${v.error || "validation failed"}). Cleared. Reconfigure in the Setup panel.\n`);
+        }
+      } else if (mergedLlm.endpoint && mergedLlm.apiKey) {
         // Only auto-configure if API key auth (doesn't need Azure login)
-        llmHelper.configure(config.llm);
+        llmHelper.configure(mergedLlm);
         console.log("  ✓ AI/LLM configured (API key)\n");
       } else {
         console.log("  ○ AI/LLM: Will activate when user selects endpoint\n");

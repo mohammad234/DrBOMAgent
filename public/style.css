@@ -84,11 +84,52 @@
 .status-indicator.off { background: #dee2e6; color: #999; }
 .status-indicator.off::after { content: ""; }
 
+/* ========== AI CONNECTION PILL (top header, next to title) ========== */
+.ai-connection-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #f1f3f5; border: 1px solid #dee2e6;
+  border-radius: 999px; padding: 4px 12px;
+  font-size: 0.78em; font-weight: 600; color: #6c757d;
+  cursor: pointer; transition: background 0.15s, border-color 0.15s, color 0.15s;
+  line-height: 1.2;
+}
+.ai-connection-pill:hover { background: #e9ecef; border-color: #ced4da; }
+.ai-connection-pill .ai-pill-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #adb5bd; flex-shrink: 0;
+}
+.ai-connection-pill.connected {
+  background: #d1e7dd; border-color: #a3cfbb; color: #0a3622;
+}
+.ai-connection-pill.connected .ai-pill-dot {
+  background: #198754;
+  box-shadow: 0 0 0 3px rgba(25, 135, 84, 0.18);
+}
+
 /* ========== AGENTIC BADGE ========== */
 .agentic-badge {
   margin-top: 10px; background: linear-gradient(135deg, #667eea, #764ba2);
   color: white; border-radius: 6px; padding: 8px 12px;
   font-size: 0.82em; font-weight: 600; text-align: center;
+}
+
+/* ========== PROVIDER GROUP HEADER (Azure / GitHub) ========== */
+.provider-group { }
+.provider-group-header {
+  font-size: 0.95em; color: #495057;
+  padding: 4px 2px;
+  border-bottom: 1px solid #e9ecef;
+}
+.provider-group-header .bi-github { color: #24292f; font-size: 1.1em; }
+.provider-group-header .bi-microsoft { font-size: 1.1em; }
+.active-badge {
+  font-size: 0.7em; font-weight: 600;
+  background: #198754; color: #fff;
+  padding: 2px 8px; border-radius: 10px;
+  letter-spacing: 0.3px;
+}
+.provider-subsection-divider {
+  border-top: 1px solid #e9ecef; opacity: 1; margin: 0;
 }
 
 /* ========== UPLOAD AREA ========== */
