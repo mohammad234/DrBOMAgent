@@ -1881,6 +1881,27 @@ function buildBCDREnvCheckboxes() {
   // Attach listeners
   document.querySelectorAll(".backup-env-cb").forEach(cb => cb.addEventListener("change", calculateBackupCost));
   document.querySelectorAll(".asr-env-cb").forEach(cb => cb.addEventListener("change", calculateASRCost));
+
+  // Pre-fill the Architecture Diagram inputs with sensible defaults from the
+  // current session (customer name + target region + environments).
+  prefillAlzDiagramInputs();
+}
+
+// Default-fill the ALZ diagram form. Called from buildBCDREnvCheckboxes() so it
+// runs every time Step 5 is set up.
+function prefillAlzDiagramInputs() {
+  const regionInput = document.getElementById("alzPrimaryRegion");
+  const drInput = document.getElementById("alzDrRegion");
+  const wgInput = document.getElementById("alzWorkloadGroups");
+  if (!regionInput || !drInput || !wgInput) return;
+  if (!regionInput.value) {
+    const regionText = document.getElementById("targetRegionSelect")?.selectedOptions[0]?.text || "";
+    regionInput.value = regionText;
+  }
+  if (!wgInput.value) {
+    const envs = (state.environments || []).filter(e => e && e !== "All");
+    wgInput.value = envs.length ? envs.join(", ") : "Production, Non-Production";
+  }
 }
 
 function calculateBackupCost() {
@@ -1987,6 +2008,123 @@ document.querySelectorAll(".lz-enable").forEach(cb => cb.addEventListener("chang
 
 document.getElementById("backToStep4").addEventListener("click", () => goToStep(4));
 document.getElementById("proceedToStep6").addEventListener("click", () => { state.stepsCompleted[5] = true; populateBOM(); goToStep(6); });
+
+// Fetch the ALZ diagram XML from the backend using the values currently in the
+// form. Returns a string of mxfile XML, or throws.
+async function fetchAlzDiagramXml() {
+  const customerName = (state.customerName || "").trim();
+  if (!customerName) throw new Error("Set a Customer Name in Step 1 first.");
+  const primaryRegion = document.getElementById("alzPrimaryRegion")?.value.trim() || "";
+  const drRegion = document.getElementById("alzDrRegion")?.value.trim() || "";
+  const wgRaw = document.getElementById("alzWorkloadGroups")?.value.trim() || "";
+  const workloadGroups = wgRaw.split(",").map(s => s.trim()).filter(Boolean);
+
+  const res = await fetch("/api/architecture/landing-zone", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customerName, primaryRegion, drRegion, workloadGroups }),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(errBody.error || `HTTP ${res.status}`);
+  }
+  return await res.text();
+}
+
+// Preview the ALZ diagram inline using the diagrams.net embed protocol.
+// We wait for the iframe's `init` message, then push the XML via postMessage \u2014
+// avoids URL-length limits and works with the chromeless viewer UI.
+document.getElementById("previewAlzDiagram")?.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const btn = e.currentTarget;
+  const status = document.getElementById("alzDiagramStatus");
+  const previewBox = document.getElementById("alzDiagramPreview");
+  const frame = document.getElementById("alzDiagramFrame");
+  if (!previewBox || !frame) return;
+
+  btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Loading\u2026';
+  if (status) { status.textContent = ""; status.className = "text-muted small"; }
+
+  try {
+    const xml = await fetchAlzDiagramXml();
+
+    // One-shot message listener: the embed posts `{event:'init'}` when ready.
+    const onMsg = (ev) => {
+      // Only react to messages from the diagrams.net embed origin.
+      if (ev.source !== frame.contentWindow) return;
+      let data;
+      try { data = typeof ev.data === "string" ? JSON.parse(ev.data) : ev.data; } catch { return; }
+      if (data && data.event === "init") {
+        frame.contentWindow.postMessage(JSON.stringify({
+          action: "load",
+          xml,
+          autosave: 0,
+        }), "*");
+        window.removeEventListener("message", onMsg);
+        if (status) { status.textContent = "\u2713 Preview loaded"; status.className = "text-success small"; }
+      }
+    };
+    window.addEventListener("message", onMsg);
+
+    // Chromeless viewer with minimal UI. `proto=json` enables the postMessage API.
+    frame.src = "https://embed.diagrams.net/?embed=1&ui=min&spin=1&proto=json&saveAndExit=0&noSaveBtn=1&noExitBtn=1";
+    previewBox.classList.remove("hidden");
+  } catch (err) {
+    if (status) { status.textContent = "Preview failed: " + err.message; status.className = "text-danger small"; }
+  } finally {
+    btn.disabled = false; btn.innerHTML = '<i class="bi bi-eye"></i> Preview';
+  }
+});
+
+document.getElementById("closeAlzPreview")?.addEventListener("click", () => {
+  const previewBox = document.getElementById("alzDiagramPreview");
+  const frame = document.getElementById("alzDiagramFrame");
+  if (previewBox) previewBox.classList.add("hidden");
+  if (frame) frame.src = "about:blank"; // tear down the embed
+});
+
+// Download the customer-branded Azure Landing Zone diagram (.drawio).
+// Pulls customer name from session state and the rest from the form inputs.
+document.getElementById("downloadAlzDiagram")?.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const btn = e.currentTarget;
+  const status = document.getElementById("alzDiagramStatus");
+  const customerName = (state.customerName || "").trim();
+  if (!customerName) {
+    if (status) { status.textContent = "Set a Customer Name in Step 1 first."; status.className = "text-danger small"; }
+    return;
+  }
+  const primaryRegion = document.getElementById("alzPrimaryRegion")?.value.trim() || "";
+  const drRegion = document.getElementById("alzDrRegion")?.value.trim() || "";
+  const wgRaw = document.getElementById("alzWorkloadGroups")?.value.trim() || "";
+  const workloadGroups = wgRaw.split(",").map(s => s.trim()).filter(Boolean);
+
+  btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Generating…';
+  if (status) { status.textContent = ""; status.className = "text-muted small"; }
+  try {
+    const res = await fetch("/api/architecture/landing-zone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ customerName, primaryRegion, drRegion, workloadGroups }),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(errBody.error || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ALZ_${customerName.replace(/[^a-zA-Z0-9_-]/g, "_")}.drawio`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    if (status) { status.textContent = "\u2713 Downloaded. Open in app.diagrams.net or the VS Code Draw.io extension."; status.className = "text-success small"; }
+  } catch (err) {
+    if (status) { status.textContent = "Failed: " + err.message; status.className = "text-danger small"; }
+  } finally {
+    btn.disabled = false; btn.innerHTML = '<i class="bi bi-download"></i> Download .drawio';
+  }
+});
 
 
 // ============ STEP 6: BOM ============

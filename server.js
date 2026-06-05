@@ -8,6 +8,7 @@ const { execSync } = require("child_process");
 const columnMapping = require("./columnMapping");
 const llmHelper = require("./llmHelper");
 const { runSetup } = require("./cliSetup");
+const { buildLandingZoneDiagram } = require("./architectureDiagram");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2788,6 +2789,29 @@ function buildCombinedSummary(envAssessments, assessmentName, region) {
 
 
 // ============ LANDING ZONE & BCDR PRICING ENDPOINTS ============
+
+// Generate a customised Azure Landing Zone diagram as a draw.io (.drawio) file.
+// Customer-specific labels: customer name in MGs/title, primary + DR regions,
+// workload landing zone spokes derived from environments seen in the inventory.
+app.post("/api/architecture/landing-zone", (req, res) => {
+  const { customerName, primaryRegion, drRegion, workloadGroups } = req.body || {};
+  if (!customerName) return res.status(400).json({ error: "customerName is required" });
+  try {
+    const xml = buildLandingZoneDiagram({
+      customerName,
+      primaryRegion: primaryRegion || "",
+      drRegion: drRegion || "",
+      workloadGroups: Array.isArray(workloadGroups) ? workloadGroups : [],
+    });
+    const safeName = String(customerName).replace(/[^a-zA-Z0-9_-]/g, "_");
+    res.setHeader("Content-Type", "application/vnd.jgraph.mxfile");
+    res.setHeader("Content-Disposition", `attachment; filename="ALZ_${safeName}.drawio"`);
+    res.send(xml);
+  } catch (err) {
+    console.error(`[ALZ Diagram] generation failed: ${err.stack || err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Fetch egress (bandwidth) pricing for a region
 app.get("/api/pricing/egress", async (req, res) => {
