@@ -1,25 +1,29 @@
 {
   "autoAssignment": {
     "strategy": "progressive-risk",
-    "description": "Assign lowest-risk groups to early waves, highest-risk to later waves. Distribute server count roughly evenly.",
+    "description": "Assign lowest-risk groups to early waves, highest-risk (production/DR) to later waves. Industry standard: pilot with non-prod, migrate prod last.",
     "environmentPriority": {
       "dev": 1, "development": 1, "sandbox": 1, "lab": 1,
-      "test": 2, "testing": 2, "qa": 2, "uat": 3, "staging": 3,
+      "test": 2, "testing": 2, "qa": 2, "uat": 3, "staging": 3, "sit": 2,
       "pre-prod": 4, "preprod": 4,
-      "prod": 5, "production": 5, "live": 5
+      "prod": 5, "production": 5, "live": 5, "dr": 5, "disaster": 5
     },
     "criticalityPriority": {
       "low": 1, "non-critical": 1, "dev": 1,
       "medium": 2, "normal": 2, "standard": 2,
-      "high": 3, "critical": 3, "mission-critical": 4, "business-critical": 4
+      "high": 3, "critical": 4, "mission-critical": 5, "business-critical": 5,
+      "tier 1": 5, "tier1": 5, "tier-1": 5,
+      "tier 2": 4, "tier2": 4, "tier-2": 4,
+      "tier 3": 3, "tier3": 3, "tier-3": 3,
+      "tier 4": 2, "tier4": 2, "tier-4": 2
     },
     "rules": [
       "1. Detect grouping column from inventory extra columns",
       "2. Group servers by detected column value",
-      "3. Score each group: avg(environmentPriority) + avg(criticalityPriority) + log(serverCount)",
-      "4. Sort groups by score ascending (low score = early wave)",
-      "5. Wave 0 pilot: assign lowest-scored group(s) up to 20% of total servers",
-      "6. Distribute remaining groups across waves, balancing server count"
+      "3. Score each group: highest envPriority hint + highest criticalityPriority hint + log(serverCount)",
+      "4. Sort groups by score ascending (low score = early wave; production/DR/Tier-1 end up last)",
+      "5. Wave 0 pilot: fill lowest-scored groups up to throughput capacity",
+      "6. Distribute remaining groups across waves preserving risk order (risk-stratified slicing, never reorder)"
     ]
   },
   "wave0": {

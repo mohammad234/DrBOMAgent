@@ -104,22 +104,12 @@ async function runSetup() {
   console.log(`  ║   Dr. BOM Agent - Setup                      ║`);
   console.log(`  ╚══════════════════════════════════════════════╝\n`);
 
-  const rl = createRL();
+  // Skip interactive Azure CLI login in favor of web-based login via the UI.
+  // The server will expose a web login flow; do not prompt on the command line.
+  console.log("  ○ Skipping CLI Azure login (use web page login if needed).");
 
-  // --- Azure Login (uses az CLI, opens browser automatically) ---
-  console.log("  ─── Azure Login ───");
-  console.log("  Uses Azure CLI (az login) — opens browser automatically.");
-  console.log("  Requires: Azure CLI installed (https://aka.ms/installazurecli)\n");
-
-  const proceed = (await ask(rl, "  Login to Azure now? (Y/n): ")).trim().toLowerCase();
-  rl.close();
-
-  if (proceed !== "n") {
-    config.azureToken = await azureLoginViaCLI();
-    if (config.azureToken && config.azureToken.tenant) {
-      config.azureTenantId = config.azureToken.tenant;
-    }
-  }
+  // No azureToken returned here; web-based login can populate token later.
+  config.azureToken = null;
 
   // Use env vars for LLM if set (no interactive prompt)
   if (config.llm.endpoint && !config.llm.apiKey) {

@@ -3,3 +3,8 @@ output/
 uploads/
 saved_sessions/
 .llm-config.json
+
+# Local test/inventory data (do not commit customer data)
+InventoryExamples/
+simulate_*.txt
+simulateUpload.js

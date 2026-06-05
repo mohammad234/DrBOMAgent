@@ -49,6 +49,9 @@ let preAuthToken = null;
 const LOCAL_CONFIG_PATH = path.join(__dirname, ".llm-config.json");
 
 function loadLocalConfig() {
+  let rawResponseText = null;
+  let refinedRawText = null;
+  let debugFilePath = null;
   try {
     if (fs.existsSync(LOCAL_CONFIG_PATH)) {
       return JSON.parse(fs.readFileSync(LOCAL_CONFIG_PATH, "utf-8"));
@@ -194,9 +197,715 @@ const TEMPLATE_CSV = path.join(__dirname, "AzureMigrateimporttemplate.csv");
 const templateContent = fs.readFileSync(TEMPLATE_CSV, "utf-8");
 const templateHeaders = templateContent.split("\n")[0].split(",").map(h => h.trim());
 
+// ============ INVENTORY PARSING (generic, works with any source file) ============
+
+// Detect the header row in a sheet by scanning the first ~10 rows and picking the one
+// that looks most like a header: mostly string cells, few numbers, plenty of cells filled,
+// and ideally containing common inventory-header keywords.
+function detectHeaderRowIndex(aoa) {
+  const HEADER_KEYWORDS = /\b(host|server|vm|name|ip|address|os|operating|cpu|core|ram|memory|disk|storage|hdd|hostname|environment|tier|application|business)\b/i;
+  const maxScan = Math.min(10, aoa.length);
+  let bestIdx = 0;
+  let bestScore = -Infinity;
+  for (let i = 0; i < maxScan; i++) {
+    const row = aoa[i] || [];
+    const filled = row.filter(c => c !== null && c !== undefined && String(c).trim() !== "");
+    if (filled.length === 0) continue;
+    let strings = 0, numbers = 0, keywordHits = 0;
+    for (const c of filled) {
+      if (typeof c === "number") numbers++;
+      else {
+        strings++;
+        if (HEADER_KEYWORDS.test(String(c))) keywordHits++;
+      }
+    }
+    // Score: heavily reward keyword hits and string ratio, penalize numbers.
+    const score = keywordHits * 10 + strings - numbers * 3 + filled.length * 0.1;
+    if (score > bestScore) { bestScore = score; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+// Parse one sheet into row objects using auto-detected header row.
+function parseSheetGeneric(sheet, sheetName) {
+  const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: null });
+  if (!aoa.length) return [];
+  const headerIdx = detectHeaderRowIndex(aoa);
+  // Collapse internal whitespace (incl. embedded \r\n from merged-cell artifacts) so the
+  // same logical column name doesn't appear twice across sheets and renders cleanly in UI.
+  const cleanName = (h, i) => {
+    const s = (h == null ? "" : String(h)).replace(/\s+/g, " ").trim();
+    return s || `Column ${i + 1}`;
+  };
+  const headers = (aoa[headerIdx] || []).map(cleanName);
+  // De-duplicate any colliding cleaned names by suffixing the duplicates.
+  const seen = new Map();
+  const finalHeaders = headers.map(h => {
+    const n = (seen.get(h) || 0) + 1;
+    seen.set(h, n);
+    return n === 1 ? h : `${h} (${n})`;
+  });
+  const rows = [];
+  for (let r = headerIdx + 1; r < aoa.length; r++) {
+    const row = aoa[r] || [];
+    if (row.every(c => c === null || c === undefined || String(c).trim() === "")) continue;
+    const obj = {};
+    for (let c = 0; c < finalHeaders.length; c++) {
+      obj[finalHeaders[c]] = row[c] == null ? "" : row[c];
+    }
+    obj._sheet = sheetName;
+    rows.push(obj);
+  }
+  return rows;
+}
+
+// Parse the entire workbook (all sheets), merging rows. Each row carries `_sheet` so
+// downstream wave-planning can use it as a free environment/site tag.
+function parseWorkbookGeneric(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".csv") {
+    const wb = XLSX.readFile(filePath, { type: "file" });
+    const sn = wb.SheetNames[0];
+    const rows = parseSheetGeneric(wb.Sheets[sn], sn || "Sheet1");
+    return { rows, sheetSummary: [{ sheet: sn, rowCount: rows.length }] };
+  }
+  const wb = XLSX.readFile(filePath);
+  const merged = [];
+  const sheetSummary = [];
+  for (const sn of wb.SheetNames) {
+    const rows = parseSheetGeneric(wb.Sheets[sn], sn);
+    sheetSummary.push({ sheet: sn, rowCount: rows.length });
+    merged.push(...rows);
+  }
+  return { rows: merged, sheetSummary };
+}
+
+// ============ AUTO COLUMN MAPPING (synonym + unit detection) ============
+
+function buildAutoMapping(sourceColumns, sampleRows) {
+  const cols = sourceColumns;
+  // Normalize a column name for pattern matching:
+  //   "Provisioned Capacity\nGB" -> "provisioned capacity gb"
+  //   "sourceCpuCoreCount"        -> "source cpu core count"
+  //   "RAM (MB)"                  -> "ram mb"
+  // This lets the same pattern catch space-separated, snake_case, and camelCase columns.
+  function norm(s) {
+    return String(s)
+      .replace(/([a-z])([A-Z])/g, "$1 $2")     // camelCase -> camel Case
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2") // ABCDef   -> ABC Def
+      .replace(/([a-zA-Z])(\d)/g, "$1 $2")     // letter+digit -> letter digit (Daily95 -> Daily 95)
+      .replace(/(\d)([a-zA-Z])/g, "$1 $2")     // digit+letter -> digit letter (95th -> 95 th)
+      .replace(/[_\-./\\]+/g, " ")
+      .replace(/[()\[\]]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+  // Sort so source* candidates come before target* (current-state preferred over planned).
+  const colsRanked = cols.slice().sort((a, b) => {
+    const an = norm(a), bn = norm(b);
+    const aTarget = an.startsWith("target ") || an.startsWith("target");
+    const bTarget = bn.startsWith("target ") || bn.startsWith("target");
+    if (aTarget !== bTarget) return aTarget ? 1 : -1;
+    return cols.indexOf(a) - cols.indexOf(b);
+  });
+  // Return ALL columns matching any of the patterns (preserve `cols` order).
+  // Multi-sheet workbooks may carry different header names per sheet (e.g. CAH PROD has
+  // "Memory" while DR has "Memory (GB)"); we must resolve per-row, not globally.
+  const findAll = (...patterns) => {
+    const matched = [];
+    for (const c of colsRanked) {
+      const n = norm(c);
+      for (const p of patterns) {
+        const re = p instanceof RegExp ? p : new RegExp(p, "i");
+        if (re.test(c) || re.test(n)) { matched.push(c); break; }
+      }
+    }
+    return matched;
+  };
+  const first = arr => (arr && arr.length ? arr[0] : null);
+
+  // Patterns are matched against both the original and the normalized form.
+  const nameCols     = findAll(/^host\s*name$/i, /^hostname$/i, /^server\s*name$/i, /^vm\s*name$/i, /^server$/i, /^name$/i, /^asset\s*name$/i, /computer\s*name/i);
+  const ipCols       = findAll(/^ip\s*address(es)?$/i, /^collected\s*ip\s*address$/i, /\bipv?4?\b/i);
+  const cpuCountCols = findAll(/^cpu\s*count$/i, /^sockets?$/i, /^socket\s*count$/i);
+  const cpuCoresCols = findAll(/^source\s*cpu\s*core\s*count$/i, /^cpu\s*core\s*count$/i, /^core\s*count$/i, /cores?\s*per\s*socket/i, /^vcpu(s)?$/i, /^cores?$/i, /^cpu$/i, /^target\s*cpu\s*core\s*count$/i);
+  const cpuThreadCols= findAll(/threads?\s*per\s*core/i, /cpu\s*core\s*thread/i, /^threads?$/i);
+  const memCols      = findAll(/^source\s*memory\s*in\s*mb$/i, /^ram\s*mb$/i, /^memory\s*mb$/i, /^ram\s*gb$/i, /^memory\s*gb$/i, /^ram$/i, /^memory$/i, /^target\s*memory\s*in\s*mb$/i);
+  const osCols       = findAll(/^operating\s*system$/i, /^os\s*name$/i, /^os$/i);
+  const osVerCols    = findAll(/^os\s*version$/i, /version.*\bos\b|\bos\b.*version/i);
+  const isVirtCols   = findAll(/^is\s*virtual$/i, /^is\s*physical$/i, /^is\s*linux$/i, /\bvirtual\?$/i);
+  const mfgCols      = findAll(/^manufacturer$/i, /^hypervisor$/i, /virtuali[sz]ation\s*platform/i, /azure\s*stack\s*host/i);
+  const descCols     = findAll(/^description$/i, /^model$/i, /^cpu\s*type$/i, /^os\s*name$/i);
+  // Utilization columns: feed performance-based right-sizing (industry-standard formula
+  // applies floor at 20%, falls back to as-allocated if missing or zero).
+  // Patterns include "usage" + "utilization" + percentile variants. Within the matched
+  // set, sortByPercentilePreference re-orders so the 95th-percentile column wins (which
+  // is what Azure Migrate uses for its performance-based recommendation).
+  const cpuUtilRaw = findAll(
+    /^cpu\s*utilization\s*percentage$/i,
+    /cpu\s*util(i[sz]ation)?(\s*%|\s*percent(age)?)?/i,
+    /cpu\s*usage(\s*percent(age)?)?/i,
+    /(p95|p99|95th|99th|peak|avg|average|median)\s*cpu/i,
+    /cpu.*\b(p95|p99|95th|99th|peak|avg|average|median)\b/i,
+    /\bcpu\s*%$/i,
+  );
+  const memUtilRaw = findAll(
+    /^memory\s*utilization\s*percentage$/i,
+    /(memory|ram|mem)\s*util(i[sz]ation)?(\s*%|\s*percent(age)?)?/i,
+    /(memory|ram|mem)\s*usage(\s*percent(age)?)?/i,
+    /(p95|p99|95th|99th|peak|avg|average|median)\s*(memory|ram|mem)/i,
+    /(memory|ram|mem).*\b(p95|p99|95th|99th|peak|avg|average|median)\b/i,
+    /\b(memory|ram|mem)\s*%$/i,
+  );
+  // Prefer 95th percentile > 99th > peak > average > median > anything else. This matches
+  // Azure Migrate's performance-based sizing methodology (95th percentile of telemetry).
+  function rankUtil(col) {
+    const n = norm(col);
+    if (/\b(95\s*th|p\s*95|95\b)\b/.test(n)) return 0;
+    if (/\b(99\s*th|p\s*99|99\b)\b/.test(n)) return 1;
+    if (/\bpeak\b/.test(n)) return 2;
+    // Check median BEFORE avg, since these inventories often prefix every util
+    // column with "avg" (= "average over the day"), so "avg" alone is the weakest signal.
+    if (/\bmedian\b/.test(n)) return 4;
+    if (/\b(avg|average)\b/.test(n)) return 3;
+    return 5;
+  }
+  const cpuUtilCols = cpuUtilRaw.slice().sort((a, b) => rankUtil(a) - rankUtil(b));
+  const memUtilCols = memUtilRaw.slice().sort((a, b) => rankUtil(a) - rankUtil(b));
+  const diskCols     = findAll(
+    /^source\s*drive\s*total\s*capacity(\s*in\s*gb)?$/i,
+    /^target\s*drive\s*total\s*capacity\s*in\s*gb$/i,
+    /^provisioned\s*capacity(\s*gb)?$/i,
+    /^used\s*size\s*gb$/i,
+    /^disk\s*space\s*gb$/i,
+    /total\s*assigned\s*hdd/i,
+    /disk\s*combined.*gb/i,
+    /^disk\s*combined$/i,
+    /^total\s*storage/i,
+    /^storage$/i,
+  );
+  // Multi-disk source columns: "Disk 1 (MB)", "Disk 2 (GB)", "Disk 14 (MB)" etc.
+  // We sum all non-empty values into Storage and use the count for Number of disks.
+  const multiDiskCols = cols.filter(c => /^disk\s*\d+\b/i.test(norm(c)));
+
+  // Pick a non-empty value across an ordered list of candidate columns.
+  function pickValue(row, candidates) {
+    for (const c of candidates) {
+      const v = row[c];
+      if (v !== undefined && v !== null && String(v).trim() !== "") return { col: c, value: v };
+    }
+    return null;
+  }
+  // Sniff a value's unit from its raw form: "1.2 TB" / "756.9 GB" / "8192" (MB) / "8" (GB).
+  function parseSizeWithUnit(raw, defaultUnit) {
+    if (raw == null) return null;
+    const s = String(raw).trim();
+    if (!s) return null;
+    const m = s.match(/^([\d.]+)\s*(tb|gb|mb|kb)?\s*$/i);
+    if (!m) return null;
+    const v = parseFloat(m[1]);
+    if (isNaN(v)) return null;
+    const unit = (m[2] || defaultUnit || "").toUpperCase();
+    if (unit === "TB") return { mb: v * 1024 * 1024, gb: v * 1024 };
+    if (unit === "GB") return { mb: v * 1024, gb: v };
+    if (unit === "MB") return { mb: v, gb: v / 1024 };
+    if (unit === "KB") return { mb: v / 1024, gb: v / (1024 * 1024) };
+    return null;
+  }
+  function unitOfCol(col, sampleRows, defaultUnit) {
+    if (!col) return defaultUnit;
+    const n = norm(col);
+    if (/\bgb\b/.test(n) || /\bin\s*gb\b/.test(n)) return "GB";
+    if (/\bmb\b/.test(n) || /\bin\s*mb\b/.test(n)) return "MB";
+    const vals = (sampleRows || []).map(r => parseFloat(r[col])).filter(n => !isNaN(n) && n > 0);
+    if (vals.length === 0) return defaultUnit;
+    const sorted = vals.slice().sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    return median < 512 ? "GB" : "MB";
+  }
+
+  // Aliases used in the UI summary — point at the first matching column.
+  const nameCol = first(nameCols), ipCol = first(ipCols), cpuCountCol = first(cpuCountCols),
+        cpuCoresCol = first(cpuCoresCols), cpuThreadCol = first(cpuThreadCols),
+        memCol = first(memCols), osCol = first(osCols), osVerCol = first(osVerCols),
+        isVirtCol = first(isVirtCols), mfgCol = first(mfgCols), descCol = first(descCols),
+        diskCol = first(diskCols);
+  const memUnit = unitOfCol(memCol, sampleRows, "MB");
+  const diskUnit = unitOfCol(diskCol, sampleRows, "GB");
+
+  const mapping = {
+    "*Server name": (row) => {
+      const r = pickValue(row, nameCols); return r ? r.value : "";
+    },
+    "IP addresses": (row) => {
+      const r = pickValue(row, ipCols); return r ? r.value : "";
+    },
+    "*Cores": (row) => {
+      const cnt = pickValue(row, cpuCountCols);
+      const core = pickValue(row, cpuCoresCols);
+      const thr = pickValue(row, cpuThreadCols);
+      if (cnt && core && thr) {
+        return (parseInt(cnt.value) || 0) * (parseInt(core.value) || 1) * (parseInt(thr.value) || 1);
+      }
+      if (core) return parseInt(core.value) || 0;
+      if (cnt) return parseInt(cnt.value) || 0;
+      return 0;
+    },
+    "*Memory (In MB)": (row) => {
+      const r = pickValue(row, memCols);
+      if (!r) return 0;
+      const v = parseFloat(r.value) || 0;
+      // Per-column unit so a workbook mixing "Memory" (GB) and "RAM (MB)" works correctly.
+      let unit;
+      if (/gb/i.test(r.col)) unit = "GB";
+      else if (/mb/i.test(r.col)) unit = "MB";
+      else unit = v > 0 && v < 512 ? "GB" : "MB";
+      return unit === "GB" ? Math.round(v * 1024) : Math.round(v);
+    },
+    "OS version": (row) => {
+      const r = pickValue(row, osVerCols); return r ? r.value : "";
+    },
+    "*OS name": (row) => {
+      const os = pickValue(row, osCols);
+      const ver = pickValue(row, osVerCols);
+      return `${os ? os.value : ""} ${ver ? ver.value : ""}`.toString().trim();
+    },
+    "OS architecture": (row) => {
+      const desc = pickValue(row, descCols);
+      const text = String(desc ? desc.value : "").toLowerCase();
+      if (text.includes("x86_64") || text.includes("amd64") || text.includes("64-bit") || text.includes("64bit")) return "x64";
+      if (text.includes("i686") || text.includes("i386") || text.includes("32-bit") || text.includes("32bit")) return "x86";
+      return "";
+    },
+    "Server type": (row) => {
+      const r = pickValue(row, isVirtCols);
+      if (r) {
+        const v = String(r.value).toUpperCase();
+        if (v === "TRUE" || v === "YES" || v === "Y" || v === "1" || v === "VIRTUAL") return "Virtual";
+        if (v === "FALSE" || v === "NO" || v === "N" || v === "0" || v === "PHYSICAL") return "Physical";
+      }
+      return "Virtual";
+    },
+    "Hypervisor": (row) => {
+      const m = pickValue(row, mfgCols);
+      const text = (m ? String(m.value) : "").toLowerCase();
+      const sheet = String(row._sheet || "").toLowerCase();
+      const blob = `${text} ${sheet}`;
+      if (blob.includes("vmware") || blob.includes("esxi") || blob.includes("vsphere")) return "Vmware";
+      if (blob.includes("hyper-v") || blob.includes("hyperv") || blob.includes("microsoft") || blob.includes("azure stack") || blob.includes("azhci")) return "Hyper-V";
+      if (blob.includes("xen")) return "Xen";
+      return "";
+    },
+    "Storage in use (In GB)": (row) => {
+      const r = pickValue(row, diskCols);
+      if (!r) return "";
+      const v = parseFloat(r.value) || 0;
+      const unit = /mb/i.test(r.col) ? "MB" : "GB";
+      return unit === "MB" ? Math.round(v / 1024) : v;
+    },
+    "Number of disks": () => "1",
+    "Disk 1 size (In GB)": (row) => {
+      const r = pickValue(row, diskCols);
+      if (!r) return "";
+      const v = parseFloat(r.value) || 0;
+      const unit = /mb/i.test(r.col) ? "MB" : "GB";
+      return unit === "MB" ? Math.round(v / 1024) : v;
+    },
+  };
+
+  const detected = {
+    nameCol, ipCol, cpuCountCol, cpuCoresCol, cpuThreadCol, memCol, memUnit,
+    osCol, osVerCol, isVirtCol, mfgCol, descCol, diskCol, diskUnit,
+    // Full candidate lists so baseline spec preserves cross-sheet variants.
+    nameCols, ipCols, cpuCountCols, cpuCoresCols, cpuThreadCols, memCols,
+    osCols, osVerCols, isVirtCols, mfgCols, descCols, diskCols,
+    multiDiskCols,
+    cpuUtilCols, memUtilCols,
+  };
+  return { mapping, detected };
+}
+
+// Choose the best mapping: prefer the static ABMB mapping ONLY when ALL of its expected
+// source columns are present (legacy customer); otherwise use the auto-detected mapping.
+function pickMappingForColumns(sourceColumns, sampleRows) {
+  const STATIC_REQUIRED = ["Host name", "CPU count", "CPU core count", "RAM (MB)", "Operating System"];
+  const allPresent = STATIC_REQUIRED.every(c => sourceColumns.includes(c));
+  if (allPresent) return { mapping: columnMapping, source: "static (ABMB legacy)", detected: null };
+  const auto = buildAutoMapping(sourceColumns, sampleRows);
+  return { mapping: auto.mapping, source: "auto-detected", detected: auto.detected };
+}
+
+// ============ MAPPING SPEC: structured, JSON-friendly, hydratable ============
+// Spec shape per target column:
+//   { columns: [...], operation: "first" | "concat" | "product", unit?: "MB"|"GB" }
+//   { operation: "static", value: "..." }
+//   null  (skip)
+// This is the format the AI returns AND the format we send back to the UI for editing.
+
+const REQUIRED_TARGETS = ["*Server name", "*Cores", "*Memory (In MB)", "*OS name"];
+
+function pickValueFromRow(row, candidates) {
+  for (const c of candidates || []) {
+    const v = row[c];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return { col: c, value: v };
+  }
+  return null;
+}
+
+// Convert a buildAutoMapping `detected` summary into the spec shape used everywhere else.
+// Preserves ALL detected candidate columns per target so cross-sheet variants (e.g. CAH
+// PROD's "Memory" + DR's "Memory (GB)") can both resolve at runtime.
+function buildBaselineSpec(detected, sourceColumns) {
+  if (!detected) return null;
+  const srcSet = new Set(sourceColumns);
+  const filt = (arr) => (arr || []).filter(c => srcSet.has(c));
+  const nameCols = filt(detected.nameCols);
+  const ipCols = filt(detected.ipCols);
+  const cpuCntCols = filt(detected.cpuCountCols);
+  const cpuCoreCols = filt(detected.cpuCoresCols);
+  const cpuThrCols = filt(detected.cpuThreadCols);
+  const memCols = filt(detected.memCols);
+  const osCols = filt(detected.osCols);
+  const osVerCols = filt(detected.osVerCols);
+  const mfgCols = filt(detected.mfgCols);
+  const diskCols = filt(detected.diskCols);
+  const multiDiskCols = filt(detected.multiDiskCols);
+  const cpuUtilCols = filt(detected.cpuUtilCols);
+  const memUtilCols = filt(detected.memUtilCols);
+
+  const spec = {};
+  spec["*Server name"] = nameCols.length ? { columns: nameCols, operation: "first" } : null;
+  spec["IP addresses"] = ipCols.length ? { columns: ipCols, operation: "first" } : null;
+  if (cpuCntCols.length && cpuCoreCols.length && cpuThrCols.length) {
+    spec["*Cores"] = { columns: [cpuCntCols[0], cpuCoreCols[0], cpuThrCols[0]], operation: "product" };
+  } else if (cpuCoreCols.length) {
+    spec["*Cores"] = { columns: cpuCoreCols, operation: "first" };
+  } else if (cpuCntCols.length) {
+    spec["*Cores"] = { columns: cpuCntCols, operation: "first" };
+  } else {
+    spec["*Cores"] = null;
+  }
+  spec["*Memory (In MB)"] = memCols.length
+    ? { columns: memCols, operation: "first", unit: detected.memUnit || "MB" }
+    : null;
+  if (osCols.length && osVerCols.length) {
+    spec["*OS name"] = { columns: [osCols[0], osVerCols[0]], operation: "concat" };
+  } else if (osCols.length) {
+    spec["*OS name"] = { columns: osCols, operation: "first" };
+  } else {
+    spec["*OS name"] = null;
+  }
+  spec["OS version"] = osVerCols.length ? { columns: osVerCols, operation: "first" } : null;
+  spec["Server type"] = { operation: "static", value: "Virtual" };
+  spec["Hypervisor"] = mfgCols.length ? { columns: mfgCols, operation: "first" } : null;
+
+  // Storage: prefer summing per-disk columns (e.g. SPSetia "Disk 1..Disk 14"); else
+  // fall back to a single combined storage column (Provisioned Capacity, Total HDD, ...).
+  if (multiDiskCols.length >= 2) {
+    spec["Storage in use (In GB)"] = { columns: multiDiskCols, operation: "sum", unit: detected.diskUnit || "MB" };
+    spec["Number of disks"] = { columns: multiDiskCols, operation: "countNonEmpty" };
+    spec["Disk 1 size (In GB)"] = { columns: [multiDiskCols[0]], operation: "first", unit: detected.diskUnit || "MB" };
+    if (multiDiskCols.length >= 2) {
+      spec["Disk 2 size (In GB)"] = { columns: [multiDiskCols[1]], operation: "first", unit: detected.diskUnit || "MB" };
+    }
+  } else {
+    spec["Storage in use (In GB)"] = diskCols.length
+      ? { columns: diskCols, operation: "first", unit: detected.diskUnit || "GB" }
+      : null;
+    spec["Disk 1 size (In GB)"] = diskCols.length
+      ? { columns: diskCols, operation: "first", unit: detected.diskUnit || "GB" }
+      : null;
+    spec["Number of disks"] = { operation: "static", value: "1" };
+  }
+
+  // Utilization columns power performance-based right-sizing in assessment.js.
+  // If the inventory carries them, map them so values reach the assessment input.
+  if (cpuUtilCols.length) spec["CPU utilization percentage"] = { columns: cpuUtilCols, operation: "first" };
+  if (memUtilCols.length) spec["Memory utilization percentage"] = { columns: memUtilCols, operation: "first" };
+
+  return spec;
+}
+
+// Validate + sanitize a spec received from LLM or UI: drop unknown source columns,
+// drop unknown targets, normalize operation to a known one, drop bad units.
+function sanitizeSpec(rawSpec, sourceColumns) {
+  const validOps = new Set(["first", "concat", "product", "static", "sum", "countNonEmpty"]);
+  const allowedTargets = new Set(templateHeaders.map(h => h.trim()));
+  const srcSet = new Set(sourceColumns);
+  const out = {};
+  for (const target of Object.keys(rawSpec || {})) {
+    if (!allowedTargets.has(target)) continue;
+    const v = rawSpec[target];
+    if (v == null) { out[target] = null; continue; }
+    if (typeof v !== "object") continue;
+    const op = String(v.operation || "first").toLowerCase();
+    if (!validOps.has(op)) continue;
+    if (op === "static") {
+      out[target] = { operation: "static", value: v.value == null ? "" : String(v.value) };
+      continue;
+    }
+    const cols = Array.isArray(v.columns) ? v.columns.filter(c => srcSet.has(c)) : [];
+    if (cols.length === 0) { out[target] = null; continue; }
+    const entry = { columns: cols, operation: op };
+    if (v.unit && /^(MB|GB)$/i.test(v.unit)) entry.unit = v.unit.toUpperCase();
+    out[target] = entry;
+  }
+  return out;
+}
+
+// Hydrate a sanitized spec into the (target -> string|function|null) shape that
+// processMapping consumes.
+function compileMappingSpec(spec) {
+  const mapping = {};
+  for (const target of templateHeaders) {
+    const t = target.trim();
+    const entry = spec[t];
+    if (entry == null) { mapping[t] = null; continue; }
+
+    if (entry.operation === "static") {
+      const val = entry.value;
+      mapping[t] = () => val;
+      continue;
+    }
+
+    const cols = entry.columns;
+    const unitDeclared = entry.unit;
+
+    if (entry.operation === "concat") {
+      mapping[t] = (row) => cols.map(c => {
+        const v = row[c];
+        return (v == null) ? "" : String(v).trim();
+      }).filter(Boolean).join(" ").trim();
+      continue;
+    }
+
+    if (entry.operation === "product") {
+      mapping[t] = (row) => {
+        const nums = cols.map(c => {
+          const v = row[c];
+          if (v == null || String(v).trim() === "") return null;
+          const n = parseInt(v);
+          return isNaN(n) ? null : n;
+        });
+        if (nums.every(n => n == null)) return 0;
+        return nums.reduce((acc, n) => acc * (n == null ? 1 : n), 1);
+      };
+      continue;
+    }
+
+    if (entry.operation === "countNonEmpty") {
+      mapping[t] = (row) => {
+        let n = 0;
+        for (const c of cols) {
+          const v = row[c];
+          if (v != null && String(v).trim() !== "" && parseFloat(v) > 0) n++;
+        }
+        return n > 0 ? n : "1";
+      };
+      continue;
+    }
+
+    if (entry.operation === "sum") {
+      // Sum all non-empty numeric cells in the listed columns; convert to target unit.
+      const targetUnit = /memory/i.test(t) ? "MB" : "GB";
+      mapping[t] = (row) => {
+        let totalMb = 0; let any = false;
+        for (const c of cols) {
+          const raw = row[c];
+          if (raw == null || String(raw).trim() === "") continue;
+          const s = String(raw).trim();
+          const m = s.match(/^([\d.]+)\s*(tb|gb|mb|kb)?\s*$/i);
+          if (!m) continue;
+          const v = parseFloat(m[1]);
+          if (isNaN(v) || v <= 0) continue;
+          let unit = (m[2] || "").toUpperCase();
+          if (!unit) {
+            if (/\bmb\b/i.test(c)) unit = "MB";
+            else if (/\bgb\b/i.test(c)) unit = "GB";
+            else if (/\btb\b/i.test(c)) unit = "TB";
+            else unit = unitDeclared || "MB";
+          }
+          const factor = { TB: 1024 * 1024, GB: 1024, MB: 1, KB: 1 / 1024 }[unit] || 1;
+          totalMb += v * factor;
+          any = true;
+        }
+        if (!any) return "";
+        return targetUnit === "MB" ? Math.round(totalMb) : Math.round(totalMb / 1024);
+      };
+      continue;
+    }
+
+    // operation === "first" (default)
+    if (unitDeclared) {
+      // Numeric with unit conversion. Used for memory (target MB) and storage (target GB).
+      const targetUnit = /memory/i.test(t) ? "MB" : "GB";
+      mapping[t] = (row) => {
+        const r = pickValueFromRow(row, cols);
+        if (!r) return "";
+        const raw = String(r.value).trim();
+        // Inline unit suffix on the value itself (e.g. "1.2 TB", "79.5 GB").
+        const m = raw.match(/^([\d.]+)\s*(tb|gb|mb|kb)\s*$/i);
+        let v, unit;
+        if (m) {
+          v = parseFloat(m[1]);
+          unit = m[2].toUpperCase();
+        } else {
+          v = parseFloat(raw);
+          if (isNaN(v)) return "";
+          // Per-column unit override: if column name itself says MB/GB, trust that.
+          if (/\bmb\b/i.test(r.col)) unit = "MB";
+          else if (/\bgb\b/i.test(r.col)) unit = "GB";
+          else unit = unitDeclared;
+        }
+        if (isNaN(v)) return "";
+        const factorToMb = { TB: 1024 * 1024, GB: 1024, MB: 1, KB: 1 / 1024 }[unit] || 1;
+        const inMb = v * factorToMb;
+        return targetUnit === "MB" ? Math.round(inMb) : Math.round(inMb / 1024);
+      };
+      continue;
+    }
+
+    mapping[t] = (row) => {
+      const r = pickValueFromRow(row, cols);
+      return r ? r.value : "";
+    };
+  }
+  return mapping;
+}
+
+// Decide if the inventory is too poor to be a server inventory at all. Done AFTER trying
+// auto + (optionally) AI mapping. Threshold: any required target with <50% non-empty rows.
+function assessInventoryQuality(rawData, mapping) {
+  const sample = rawData.slice(0, Math.min(50, rawData.length));
+  const issues = [];
+  for (const target of REQUIRED_TARGETS) {
+    const fn = mapping[target];
+    let filled = 0;
+    for (const row of sample) {
+      let v;
+      if (typeof fn === "function") v = fn(row);
+      else if (typeof fn === "string") v = row[fn];
+      else v = "";
+      if (v !== undefined && v !== null && String(v).trim() !== "" && String(v).trim() !== "0") filled++;
+    }
+    const ratio = sample.length ? filled / sample.length : 0;
+    if (ratio < 0.5) issues.push({ target, filledRatio: ratio });
+  }
+  return {
+    looksLikeInventory: issues.length === 0,
+    issues,
+  };
+}
+
+// Reprocess the cached source data of a session under a new mapping. Rewrites all output
+// files in place and updates the session record. Returns a fresh response payload.
+function reprocessSession(session, sessionId, mapping, mappingSource) {
+  const rawData = session.sourceData;
+  const { validRows, invalidRows, report } = processMapping(rawData, mapping);
+
+  const azMigrateCsv = generateCsv(validRows, templateHeaders);
+  const azMigratePath = path.join(session.outputDir, "AzureMigrate_Import.csv");
+  fs.writeFileSync(azMigratePath, azMigrateCsv, "utf-8");
+
+  const excludedPath = path.join(session.outputDir, "Excluded_Servers.csv");
+  if (invalidRows.length > 0) {
+    const excludedHeaders = [...templateHeaders, "Error"];
+    fs.writeFileSync(excludedPath, generateCsv(invalidRows, excludedHeaders), "utf-8");
+  } else if (fs.existsSync(excludedPath)) {
+    fs.unlinkSync(excludedPath);
+  }
+
+  const reportText = generateReport(rawData.length, validRows, invalidRows, report);
+  fs.writeFileSync(path.join(session.outputDir, "conversion_report.txt"), reportText, "utf-8");
+
+  session.validCount = validRows.length;
+  session.invalidCount = invalidRows.length;
+  session.reportText = reportText;
+  session.errors = invalidRows.map(r => ({
+    serverName: r["*Server name"] || "Unknown",
+    error: r["Error"],
+  }));
+  session.activeMappingSource = mappingSource;
+  return { validRows, invalidRows, reportText };
+}
+
+// Build the UI-friendly mappingInfo array directly from a sanitized spec.
+function specToMappingInfo(spec, sourceColumns) {
+  const sourceSet = new Set(sourceColumns);
+  const info = [];
+  for (const target of templateHeaders) {
+    const t = target.trim();
+    const entry = spec[t];
+    let source = null, type = "unmapped", reason = "No mapping defined";
+    if (entry == null) {
+      reason = "No source column matched";
+    } else if (entry.operation === "static") {
+      type = "computed";
+      source = "(static)";
+      reason = `Default value: "${entry.value}"`;
+    } else if (entry.operation === "concat") {
+      type = "computed";
+      source = entry.columns.join(" + ");
+      reason = `Concatenated: ${entry.columns.map(c => `"${c}"`).join(" + ")}`;
+    } else if (entry.operation === "product") {
+      type = "computed";
+      source = entry.columns.join(" \u00d7 ");
+      reason = `Product: ${entry.columns.map(c => `"${c}"`).join(" \u00d7 ")}`;
+    } else if (entry.operation === "sum") {
+      type = "computed";
+      source = entry.columns.length <= 3
+        ? entry.columns.join(" + ")
+        : `${entry.columns[0]} + ... + ${entry.columns[entry.columns.length - 1]} (${entry.columns.length} cols)`;
+      reason = `Sum across ${entry.columns.length} disk column${entry.columns.length === 1 ? "" : "s"}${entry.unit ? ` (${entry.unit})` : ""}`;
+    } else if (entry.operation === "countNonEmpty") {
+      type = "computed";
+      source = `count(${entry.columns.length} disk cols)`;
+      reason = `Count of non-empty values across ${entry.columns.length} disk columns`;
+    } else if (entry.operation === "first") {
+      const present = entry.columns.filter(c => sourceSet.has(c));
+      if (present.length === 0) {
+        reason = "Listed source columns not in inventory";
+      } else if (present.length === 1) {
+        type = "direct";
+        source = present[0];
+        reason = `Direct match: "${present[0]}" \u2192 "${t}"${entry.unit ? ` (${entry.unit})` : ""}`;
+      } else {
+        type = "computed";
+        source = present.join(" | ");
+        reason = `First non-empty across: ${present.map(c => `"${c}"`).join(", ")}${entry.unit ? ` (${entry.unit})` : ""}`;
+      }
+    }
+    info.push({ target: t, source, type, reason });
+  }
+  return info;
+}
+
 // ============ CSV PROCESSING ROUTES ============
 
-app.post("/api/upload", upload.single("inventory"), (req, res) => {
+// Identify which required targets the current mapping is filling poorly. Used to decide
+// whether automatic LLM verification on upload is worthwhile.
+function findWeakTargets(rawData, mapping, threshold) {
+  const sample = rawData.slice(0, Math.min(80, rawData.length));
+  const weak = [];
+  for (const target of REQUIRED_TARGETS) {
+    const fn = mapping[target];
+    if (fn == null) { weak.push(target); continue; }
+    let filled = 0;
+    for (const row of sample) {
+      let v;
+      if (typeof fn === "function") v = fn(row);
+      else if (typeof fn === "string") v = row[fn];
+      else v = "";
+      if (v !== undefined && v !== null && String(v).trim() !== "" && String(v).trim() !== "0") filled++;
+    }
+    const ratio = sample.length ? filled / sample.length : 0;
+    if (ratio < threshold) weak.push(target);
+  }
+  return weak;
+}
+
+app.post("/api/upload", upload.single("inventory"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -205,14 +914,11 @@ app.post("/api/upload", upload.single("inventory"), (req, res) => {
     const filePath = req.file.path;
 
     let rawData;
+    let sheetSummary = [];
     try {
-      const workbook = XLSX.readFile(filePath);
-      const sheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[sheetName];
-      rawData = XLSX.utils.sheet_to_json(sheet, { range: 2 });
-      if (!rawData || rawData.length === 0) {
-        rawData = XLSX.utils.sheet_to_json(sheet);
-      }
+      const parsed = parseWorkbookGeneric(filePath);
+      rawData = parsed.rows;
+      sheetSummary = parsed.sheetSummary;
     } catch (err) {
       fs.unlinkSync(filePath);
       return res.status(400).json({ error: `Failed to parse file: ${err.message}` });
@@ -223,81 +929,144 @@ app.post("/api/upload", upload.single("inventory"), (req, res) => {
       return res.status(400).json({ error: "File contains no data rows" });
     }
 
-    const sourceColumns = Object.keys(rawData[0]);
-    const { validRows, invalidRows, report } = processMapping(rawData);
+    const sourceColumnSet = new Set();
+    for (const r of rawData) for (const k of Object.keys(r)) if (k !== "_sheet") sourceColumnSet.add(k);
+    const sourceColumns = Array.from(sourceColumnSet);
+
+    const sampleRows = rawData.slice(0, Math.min(50, rawData.length));
+
+    const STATIC_REQUIRED = ["Host name", "CPU count", "CPU core count", "RAM (MB)", "Operating System"];
+    const isLegacyAbmb = STATIC_REQUIRED.every(c => sourceColumns.includes(c));
+    let activeSpec = null;
+    let activeMapping;
+    let mappingSource;
+    if (isLegacyAbmb) {
+      activeMapping = columnMapping;
+      mappingSource = "static (ABMB legacy)";
+    } else {
+      const auto = buildAutoMapping(sourceColumns, sampleRows);
+      activeSpec = buildBaselineSpec(auto.detected, sourceColumns);
+      activeMapping = compileMappingSpec(activeSpec);
+      mappingSource = "auto-detected";
+    }
+
+    // Auto LLM verification on weakness. Status semantics:
+    //   not-needed              : rules cover all required targets >=90%; LLM is skipped.
+    //   triggered-applied       : weakness found, LLM ran, refined N targets.
+    //   triggered-no-change     : weakness found, LLM ran, no improvement over rules.
+    //   triggered-failed        : weakness found, LLM ran, error - falling back to rules.
+    //   required-not-configured : weakness found AND LLM is NOT configured -> we BLOCK
+    //                             the upload because the rule-based mapping is incomplete
+    //                             and we have no AI to fall back to. User must configure
+    //                             the AI model (see /api/llm/configure) and re-upload.
+    let aiNotice = null;
+    let aiStatus = "not-needed";
+    let weakTargets = [];
+    if (activeSpec) {
+      weakTargets = findWeakTargets(rawData, activeMapping, 0.9);
+      if (weakTargets.length > 0) {
+        if (!llmHelper.isConfigured()) {
+          fs.unlinkSync(filePath);
+          return res.status(412).json({
+            error: "AI model required for this inventory.",
+            errorCode: "LLM_REQUIRED",
+            message: `The rule-based mapper could not confidently map all required columns (${weakTargets.join(", ")}). An AI model is required to verify and refine the mapping. Please configure the AI model under Settings and re-upload.`,
+            weakTargets,
+            sourceColumns,
+          });
+        }
+        try {
+          const llmSamples = rawData.slice(0, 8).map(r => {
+            const o = {}; for (const k of Object.keys(r)) if (k !== "_sheet") o[k] = r[k]; return o;
+          });
+          const suggestion = await llmHelper.suggestColumnMapping(
+            sourceColumns, templateHeaders, llmSamples, activeSpec,
+          );
+          if (suggestion && typeof suggestion === "object") {
+            const aiSpec = sanitizeSpec(suggestion, sourceColumns);
+            const merged = { ...activeSpec };
+            const targetsTouched = [];
+            for (const target of templateHeaders) {
+              const t = target.trim();
+              const ai = aiSpec[t];
+              const isWeakRequired = weakTargets.includes(t);
+              const baselineNull = merged[t] == null;
+              if (ai != null && (isWeakRequired || baselineNull)) {
+                merged[t] = ai;
+                targetsTouched.push(t);
+              }
+            }
+            if (targetsTouched.length > 0) {
+              activeSpec = merged;
+              activeMapping = compileMappingSpec(activeSpec);
+              mappingSource = "auto-detected + AI verified";
+              aiStatus = "triggered-applied";
+              aiNotice = { applied: true, targets: targetsTouched, originalWeakTargets: weakTargets };
+            } else {
+              aiStatus = "triggered-no-change";
+              aiNotice = { applied: false, reason: "AI confirmed rule-based mapping was already correct.", originalWeakTargets: weakTargets };
+            }
+          } else {
+            aiStatus = "triggered-failed";
+            aiNotice = { applied: false, reason: "AI did not return a usable suggestion.", originalWeakTargets: weakTargets };
+          }
+        } catch (err) {
+          console.error("[Upload AI verify] error:", err.message);
+          aiStatus = "triggered-failed";
+          aiNotice = { applied: false, reason: `AI verification failed: ${err.message}`, originalWeakTargets: weakTargets };
+        }
+      }
+    }
+
+    const { validRows, invalidRows, report } = processMapping(rawData, activeMapping);
 
     const sessionId = crypto.randomUUID();
     const outputDir = path.join(__dirname, "output", sessionId);
     fs.mkdirSync(outputDir, { recursive: true });
 
-    // Write valid CSV
     const azMigrateCsv = generateCsv(validRows, templateHeaders);
     const azMigratePath = path.join(outputDir, "AzureMigrate_Import.csv");
     fs.writeFileSync(azMigratePath, azMigrateCsv, "utf-8");
 
-    // Write excluded servers CSV
     if (invalidRows.length > 0) {
       const excludedHeaders = [...templateHeaders, "Error"];
       const excludedCsv = generateCsv(invalidRows, excludedHeaders);
       fs.writeFileSync(path.join(outputDir, "Excluded_Servers.csv"), excludedCsv, "utf-8");
     }
 
-    // Write report
     const reportText = generateReport(rawData.length, validRows, invalidRows, report);
     fs.writeFileSync(path.join(outputDir, "conversion_report.txt"), reportText, "utf-8");
 
-    // Store session
     sessions[sessionId] = {
       sourceFile: req.file.originalname,
       sourceFilePath: req.file.path,
       sourceColumns,
       sourceData: rawData,
-      originalData: rawData, // Preserve original columns for assessment output
+      originalData: rawData,
       totalRows: rawData.length,
       validCount: validRows.length,
       invalidCount: invalidRows.length,
       outputDir,
       azMigratePath,
       reportText,
+      activeSpec,
+      activeMappingSource: mappingSource,
       errors: invalidRows.map(r => ({
         serverName: r["*Server name"] || "Unknown",
         error: r["Error"],
       })),
     };
 
-    // Build mapping info for UI display
-    const mappingInfo = [];
-    for (const targetCol of templateHeaders) {
-      const mapping = columnMapping[targetCol];
-      let sourceCol = null;
-      let type = "unmapped";
-      let reason = "No mapping defined";
-      if (typeof mapping === "string") {
-        sourceCol = mapping;
-        if (sourceColumns.includes(mapping)) {
-          type = "direct";
-          reason = `Direct match: "${mapping}" → "${targetCol}"`;
-        } else {
-          type = "missing";
-          reason = `Expected source column "${mapping}" not found in inventory`;
-        }
-      } else if (typeof mapping === "function") {
-        type = "computed";
-        sourceCol = "(computed)";
-        // Try to describe what the function does based on known patterns
-        const funcStr = mapping.toString();
-        if (targetCol === "*Cores") reason = "Computed: CPU count × core count × threads";
-        else if (targetCol === "*OS name") reason = "Computed: OS + version combined";
-        else if (targetCol === "OS architecture") reason = "Derived from Description field";
-        else if (targetCol === "Server type") reason = "Derived from Is Virtual field";
-        else if (targetCol === "Hypervisor") reason = "Derived from Manufacturer field";
-        else if (targetCol === "Number of disks") reason = "Default value: 1";
-        else reason = "Computed from source columns";
-      } else if (mapping === null) {
-        reason = "Optional — no source data available";
-      }
-      mappingInfo.push({ target: targetCol, source: sourceCol, type, reason });
-    }
+    const quality = assessInventoryQuality(rawData, activeMapping);
+
+    const mappingInfo = activeSpec
+      ? specToMappingInfo(activeSpec, sourceColumns)
+      : templateHeaders.map(targetCol => {
+          const m = activeMapping[targetCol];
+          if (typeof m === "string") return { target: targetCol, source: m, type: "direct", reason: `Direct match: "${m}" \u2192 "${targetCol}"` };
+          if (typeof m === "function") return { target: targetCol, source: "(computed)", type: "computed", reason: "Computed from source columns" };
+          return { target: targetCol, source: null, type: "unmapped", reason: "Optional \u2014 no source data available" };
+        });
 
     fs.unlinkSync(filePath);
 
@@ -307,7 +1076,17 @@ app.post("/api/upload", upload.single("inventory"), (req, res) => {
       validRows: validRows.length,
       invalidRows: invalidRows.length,
       sourceColumns,
+      sheetSummary,
+      mappingSource,
       mappingInfo,
+      activeSpec,
+      aiStatus,
+      aiNotice,
+      weakTargets,
+      inventoryQualityIssue: !quality.looksLikeInventory ? {
+        message: "This file does not look like a server inventory. Required columns (server name, CPU/cores, memory, OS) could not be identified for most rows. Please verify you uploaded the correct file or use AI Assisted Mapping to refine.",
+        details: quality.issues,
+      } : null,
       errors: sessions[sessionId].errors,
       report: reportText,
       hasErrors: invalidRows.length > 0,
@@ -911,18 +1690,122 @@ app.get("/api/azure/serverless-endpoints", async (req, res) => {
   }
 });
 
-// LLM-assisted column mapping suggestion
+// LLM-assisted column mapping. Session-aware: uses the cached source data for samples
+// and applies the suggestion immediately, returning the new validation outcome so the
+// UI can show real before/after counts.
 app.post("/api/llm/suggest-mapping", async (req, res) => {
-  const { sourceColumns } = req.body;
+  const { sessionId } = req.body || {};
   if (!llmHelper.isConfigured()) {
     return res.status(400).json({ error: "LLM not configured. Provide Azure OpenAI details in settings." });
   }
+  const session = sessionId ? sessions[sessionId] : null;
+  if (!session) {
+    return res.status(400).json({ error: "Session not found. Re-upload the inventory file." });
+  }
   try {
-    const suggestion = await llmHelper.suggestColumnMapping(sourceColumns, templateHeaders);
-    if (!suggestion) {
-      return res.status(500).json({ error: "LLM returned no result. Check your deployment." });
+    const sourceColumns = session.sourceColumns || [];
+    const sampleRows = (session.sourceData || []).slice(0, 8).map(r => {
+      const o = {}; for (const k of Object.keys(r)) if (k !== "_sheet") o[k] = r[k]; return o;
+    });
+    // Provide LLM the current baseline (auto-detected) so it has somewhere to start.
+    let baselineSpec = session.activeSpec;
+    if (!baselineSpec) {
+      const auto = buildAutoMapping(sourceColumns, session.sourceData.slice(0, 50));
+      baselineSpec = buildBaselineSpec(auto.detected, sourceColumns);
     }
-    res.json({ suggestion });
+
+    const suggestion = await llmHelper.suggestColumnMapping(
+      sourceColumns,
+      templateHeaders,
+      sampleRows,
+      baselineSpec,
+    );
+    if (!suggestion || typeof suggestion !== "object") {
+      return res.status(502).json({ error: "AI returned no usable mapping. Check model deployment and try again." });
+    }
+
+    // Sanitize against actual source columns and template headers.
+    const aiSpec = sanitizeSpec(suggestion, sourceColumns);
+
+    // Merge: AI overrides baseline only where it produced a non-null entry. Targets the
+    // AI omits or nullifies fall back to the baseline so we never regress coverage.
+    const mergedSpec = {};
+    for (const target of templateHeaders) {
+      const t = target.trim();
+      const ai = aiSpec[t];
+      const base = baselineSpec ? baselineSpec[t] : null;
+      mergedSpec[t] = ai != null ? ai : (base != null ? base : null);
+    }
+
+    const compiled = compileMappingSpec(mergedSpec);
+    const quality = assessInventoryQuality(session.sourceData, compiled);
+
+    if (!quality.looksLikeInventory) {
+      return res.status(200).json({
+        applied: false,
+        inventoryQualityIssue: {
+          message: "Even after AI mapping, required columns (server name, CPU/cores, memory, OS) cannot be filled for most rows. This file does not appear to be a server inventory.",
+          details: quality.issues,
+        },
+        activeSpec: mergedSpec,
+        mappingInfo: specToMappingInfo(mergedSpec, sourceColumns),
+      });
+    }
+
+    reprocessSession(session, sessionId, compiled, "AI-assisted");
+    session.activeSpec = mergedSpec;
+
+    res.json({
+      applied: true,
+      sessionId,
+      mappingSource: "AI-assisted",
+      activeSpec: mergedSpec,
+      mappingInfo: specToMappingInfo(mergedSpec, sourceColumns),
+      totalRows: session.totalRows,
+      validRows: session.validCount,
+      invalidRows: session.invalidCount,
+      errors: session.errors,
+      report: session.reportText,
+      hasErrors: session.invalidCount > 0,
+    });
+  } catch (err) {
+    console.error("[AI mapping] error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Manual remap: user-edited mapping spec applied to a session's cached source data.
+app.post("/api/sessions/:sessionId/remap", (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions[sessionId];
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  const { spec } = req.body || {};
+  if (!spec || typeof spec !== "object") {
+    return res.status(400).json({ error: "Missing mapping spec" });
+  }
+  try {
+    const sourceColumns = session.sourceColumns || [];
+    const cleaned = sanitizeSpec(spec, sourceColumns);
+    const compiled = compileMappingSpec(cleaned);
+    const quality = assessInventoryQuality(session.sourceData, compiled);
+    reprocessSession(session, sessionId, compiled, "user-edited");
+    session.activeSpec = cleaned;
+    res.json({
+      sessionId,
+      mappingSource: "user-edited",
+      activeSpec: cleaned,
+      mappingInfo: specToMappingInfo(cleaned, sourceColumns),
+      totalRows: session.totalRows,
+      validRows: session.validCount,
+      invalidRows: session.invalidCount,
+      errors: session.errors,
+      report: session.reportText,
+      hasErrors: session.invalidCount > 0,
+      inventoryQualityIssue: !quality.looksLikeInventory ? {
+        message: "Required columns (server name, CPU/cores, memory, OS) are still unfilled for most rows.",
+        details: quality.issues,
+      } : null,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1306,7 +2189,7 @@ app.get("/api/assessment/prefetch-region", async (req, res) => {
 app.post("/api/assessment/run", async (req, res) => {
   const token = getToken(req); // Optional — used for ARM VM specs if available
 
-  const { subscriptionId, sessionId, region, assessmentName, pricingModel, useAhub, enabledSeries, cpuArchitecture, storageTier, securityEnabled } = req.body;
+  const { subscriptionId, sessionId, region, assessmentName, pricingModel, useAhub, enabledSeries, cpuArchitecture, storageTier, securityEnabled, sizingMode } = req.body;
   const session = sessions[sessionId];
   if (!session) return res.status(404).json({ error: "Upload session not found. Re-upload inventory." });
 
@@ -1394,7 +2277,7 @@ app.post("/api/assessment/run", async (req, res) => {
 
     // Step 2: First-pass matching
     sendEvent({ type: "progress", step: 2, totalSteps, label: `Matching ${totalServers} servers internally...`, serverCount: totalServers });
-    const firstPassResults = assessment.runFirstPassMatching(servers, vmSizes, series, arch, diskTier);
+    const firstPassResults = assessment.runFirstPassMatching(servers, vmSizes, series, arch, diskTier, sizingMode);
     const matchedCount = firstPassResults.filter(r => r.vmMatch).length;
     sendEvent({ type: "progress", step: 2, totalSteps, label: `Matched ${matchedCount}/${totalServers} servers`, serverCount: totalServers, done: true });
 
@@ -1426,7 +2309,7 @@ app.post("/api/assessment/run", async (req, res) => {
     sendEvent({ type: "progress", step: 5, totalSteps, label: "Generating report...", serverCount: totalServers });
     const report = assessment.generateAssessmentReport(finalResults, vmPricingResult.data, diskPricingResult.data, {
       assessmentName, region, pricingModel: pricing, useAhub: ahub, vmSizes, enabledSeries: series, cpuArchitecture: arch,
-      securityEnabled: secEnabled, securityPerServerPrice: securityPrice,
+      securityEnabled: secEnabled, securityPerServerPrice: securityPrice, sizingModeOverride: sizingMode,
     });
 
     session.assessmentReport = report;
@@ -1436,6 +2319,7 @@ app.post("/api/assessment/run", async (req, res) => {
     session.lastVmSizes = vmSizes;
     session.lastEnabledSeries = series;
     session.lastCpuArchitecture = arch;
+    session.lastSizingMode = sizingMode || "auto";
 
     const totalTime = Date.now() - stepStartTime;
     sendEvent({ type: "progress", step: 5, totalSteps, label: "Report complete!", serverCount: totalServers, done: true });
@@ -1451,7 +2335,7 @@ app.post("/api/assessment/run", async (req, res) => {
 
 // Re-generate report with different pricing/AHUB/security (no re-matching, instant)
 app.post("/api/assessment/recalculate", async (req, res) => {
-  const { sessionId, region, assessmentName, pricingModel, useAhub, cpuArchitecture, securityEnabled } = req.body;
+  const { sessionId, region, assessmentName, pricingModel, useAhub, cpuArchitecture, securityEnabled, sizingMode } = req.body;
   const session = sessions[sessionId];
   if (!session || !session.lastMatchedServers) {
     return res.status(404).json({ error: "No matched data. Run assessment first." });
@@ -1466,10 +2350,12 @@ app.post("/api/assessment/recalculate", async (req, res) => {
     const vmPricingResult = await assessment.fetchAllVmPricing(region, pricing);
     const diskPricingResult = await assessment.fetchAllDiskPricing(region);
 
+    const effectiveSizingMode = sizingMode || session.lastSizingMode || "auto";
     const report = assessment.generateAssessmentReport(session.lastMatchedServers, vmPricingResult.data, diskPricingResult.data, {
       assessmentName, region, pricingModel: pricing, useAhub: ahub,
       vmSizes: session.lastVmSizes || [], enabledSeries: session.lastEnabledSeries || [],
       cpuArchitecture: arch, securityEnabled: secEnabled, securityPerServerPrice: securityPrice,
+      sizingModeOverride: effectiveSizingMode,
     });
 
     session.assessmentReport = report;
@@ -1592,6 +2478,7 @@ app.post("/api/assessment/run-multi", async (req, res) => {
       const diskTier = config.storageTier && config.storageTier !== "auto" ? config.storageTier : null;
       const series = config.enabledSeries || [];
       const secEnabled = config.securityEnabled !== false;
+      const sizingMode = config.sizingMode || "auto";
 
       // Filter servers for this environment
       let envServers;
@@ -1608,7 +2495,7 @@ app.post("/api/assessment/run-multi", async (req, res) => {
       sendEvent({ type: "env-progress", envName, envIdx: envIdx + 1, totalEnvs, label: `Assessing ${envName} (${envServers.length} servers)...`, serverCount: envServers.length });
 
       // Match
-      const firstPassResults = assessment.runFirstPassMatching(envServers, vmSizes, series, arch, diskTier);
+      const firstPassResults = assessment.runFirstPassMatching(envServers, vmSizes, series, arch, diskTier, sizingMode);
 
       // LLM (skip if not configured or user opted out)
       let finalResults;
@@ -1625,18 +2512,20 @@ app.post("/api/assessment/run-multi", async (req, res) => {
       const report = assessment.generateAssessmentReport(finalResults, vmPricingData, diskPricingResult.data, {
         assessmentName: `${assessmentName} - ${envName}`, region, pricingModel: pricing, useAhub: ahub,
         vmSizes, enabledSeries: series, cpuArchitecture: arch,
-        securityEnabled: secEnabled, securityPerServerPrice: securityPrice,
+        securityEnabled: secEnabled, securityPerServerPrice: securityPrice, sizingModeOverride: sizingMode,
       });
 
       session.envAssessments[envName] = {
         report,
         matchedServers: finalResults,
+        inputServers: envServers,
         enabledSeries: series,
         cpuArchitecture: arch,
         storageTier: diskTier,
         pricingModel: pricing,
         useAhub: ahub,
         securityEnabled: secEnabled,
+        sizingMode,
       };
 
       sendEvent({ type: "env-complete", envName, envIdx: envIdx + 1, totalEnvs, report });
@@ -1662,7 +2551,7 @@ app.post("/api/assessment/run-multi", async (req, res) => {
 
 // Recalculate single environment (instant, no re-matching)
 app.post("/api/assessment/recalculate-env", async (req, res) => {
-  const { sessionId, envName, region, assessmentName, pricingModel, useAhub, cpuArchitecture, securityEnabled } = req.body;
+  const { sessionId, envName, region, assessmentName, pricingModel, useAhub, cpuArchitecture, securityEnabled, sizingMode } = req.body;
   const session = sessions[sessionId];
   if (!session || !session.envAssessments || !session.envAssessments[envName]) {
     return res.status(404).json({ error: "No assessment data for this environment." });
@@ -1675,14 +2564,26 @@ app.post("/api/assessment/recalculate-env", async (req, res) => {
     const arch = cpuArchitecture || envData.cpuArchitecture || "amd";
     const secEnabled = securityEnabled !== undefined ? securityEnabled : envData.securityEnabled;
     const securityPrice = session.lastSecurityPrice || 15.00;
+    const newSizingMode = sizingMode !== undefined ? sizingMode : (envData.sizingMode || "auto");
 
     const vmPricingResult = await assessment.fetchAllVmPricing(region, pricing);
     const diskPricingResult = await assessment.fetchAllDiskPricing(region);
 
-    const report = assessment.generateAssessmentReport(envData.matchedServers, vmPricingResult.data, diskPricingResult.data, {
+    // If sizing mode changed, we must re-run first-pass matching since the SKU itself
+    // can change when reqCores/reqMemMB shift. Pricing-only changes reuse cached match.
+    let matchedForReport = envData.matchedServers;
+    if (newSizingMode !== (envData.sizingMode || "auto") && envData.inputServers) {
+      matchedForReport = assessment.runFirstPassMatching(
+        envData.inputServers, session.lastVmSizes || [], envData.enabledSeries || [], arch, envData.storageTier, newSizingMode
+      );
+      envData.matchedServers = matchedForReport;
+    }
+
+    const report = assessment.generateAssessmentReport(matchedForReport, vmPricingResult.data, diskPricingResult.data, {
       assessmentName: `${assessmentName} - ${envName}`, region, pricingModel: pricing, useAhub: ahub,
       vmSizes: session.lastVmSizes || [], enabledSeries: envData.enabledSeries || [],
       cpuArchitecture: arch, securityEnabled: secEnabled, securityPerServerPrice: securityPrice,
+      sizingModeOverride: newSizingMode,
     });
 
     // Update stored data
@@ -1690,6 +2591,7 @@ app.post("/api/assessment/recalculate-env", async (req, res) => {
     envData.pricingModel = pricing;
     envData.useAhub = ahub;
     envData.securityEnabled = secEnabled;
+    envData.sizingMode = newSizingMode;
 
     // Rebuild combined
     const combined = buildCombinedSummary(session.envAssessments, assessmentName, region);
@@ -1706,6 +2608,19 @@ function buildCombinedSummary(envAssessments, assessmentName, region) {
   let totalCompute = 0, totalStorage = 0, totalSecurity = 0;
   let totalServers = 0, totalSuitable = 0, totalNotSuitable = 0;
   const allServers = [];
+  // Sizing summary aggregation across envs
+  const combinedSizing = {
+    modeRequested: null,
+    totalServers: 0,
+    asAllocated: 0,
+    performanceBased: 0,
+    performanceBasedPartial: 0,
+    flooredCount: 0,
+    cappedCount: 0,
+    zeroFallbackCount: 0,
+    missingFallbackCount: 0,
+  };
+  const modesSeen = new Set();
 
   for (const [envName, envData] of Object.entries(envAssessments)) {
     const s = envData.report.summary;
@@ -1719,7 +2634,20 @@ function buildCombinedSummary(envAssessments, assessmentName, region) {
     for (const srv of envData.report.servers) {
       allServers.push({ ...srv, environment: envName });
     }
+    const ss = envData.report.sizingSummary;
+    if (ss) {
+      modesSeen.add(ss.modeRequested);
+      combinedSizing.totalServers += ss.totalServers || 0;
+      combinedSizing.asAllocated += ss.asAllocated || 0;
+      combinedSizing.performanceBased += ss.performanceBased || 0;
+      combinedSizing.performanceBasedPartial += ss.performanceBasedPartial || 0;
+      combinedSizing.flooredCount += ss.flooredCount || 0;
+      combinedSizing.cappedCount += ss.cappedCount || 0;
+      combinedSizing.zeroFallbackCount += ss.zeroFallbackCount || 0;
+      combinedSizing.missingFallbackCount += ss.missingFallbackCount || 0;
+    }
   }
+  combinedSizing.modeRequested = modesSeen.size === 1 ? [...modesSeen][0] : "mixed";
 
   const totalMonthlyCost = totalCompute + totalStorage + totalSecurity;
   return {
@@ -1727,6 +2655,7 @@ function buildCombinedSummary(envAssessments, assessmentName, region) {
     region,
     timestamp: new Date().toISOString(),
     pricingModel: "Multi-Environment",
+    sizingSummary: combinedSizing,
     summary: {
       totalServers,
       suitable: totalSuitable,
@@ -1946,7 +2875,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
-function processMapping(rawData) {
+function processMapping(rawData, mappingOverride) {
+  const activeMapping = mappingOverride || columnMapping;
   const resultRows = [];
   const report = { duplicateNames: 0, duplicateIPs: 0, ipsCleaned: 0, osVersionsCleaned: 0 };
 
@@ -1954,7 +2884,7 @@ function processMapping(rawData) {
     const targetRow = {};
     for (const templateCol of templateHeaders) {
       const colName = templateCol.trim();
-      const mapping = columnMapping[colName];
+      const mapping = activeMapping[colName];
       if (mapping === null || mapping === undefined) {
         targetRow[colName] = "";
       } else if (typeof mapping === "function") {
@@ -2167,21 +3097,53 @@ app.post("/api/waveplan/generate", (req, res) => {
     }
   }
 
-  // Score each group for priority assignment
-  const envPriority = wavePlanLogic.autoAssignment.environmentPriority;
-  const critPriority = wavePlanLogic.autoAssignment.criticalityPriority;
+  // Score each group for priority assignment.
+  // The scoring is intentionally generic: callers may have any tag/column convention,
+  // so we look at group name AND any string fields on the servers (extraColumns + environment)
+  // to find optional hints from the configured priority dictionaries. If no hint matches,
+  // we fall back to a neutral score and tiebreak by server count ascending so that
+  // smaller groups get earlier waves (good pilot candidates).
+  const envPriority = (wavePlanLogic.autoAssignment && wavePlanLogic.autoAssignment.environmentPriority) || {};
+  const critPriority = (wavePlanLogic.autoAssignment && wavePlanLogic.autoAssignment.criticalityPriority) || {};
+
+  function findPriorityHint(haystack, dict) {
+    if (!haystack || !dict) return null;
+    const lower = haystack.toLowerCase();
+    let best = null;
+    for (const [key, val] of Object.entries(dict)) {
+      if (!key) continue;
+      if (lower.includes(key.toLowerCase())) {
+        // For a heterogeneous group, the highest-risk hint wins: a group that contains
+        // even one production server should be treated as production (industry practice).
+        if (best === null || val > best) best = val;
+      }
+    }
+    return best;
+  }
 
   const scoredGroups = Object.entries(groups).map(([name, srvs]) => {
-    let envScore = 3; // default mid
-    const nameLower = name.toLowerCase();
-    for (const [key, val] of Object.entries(envPriority)) {
-      if (nameLower.includes(key)) { envScore = val; break; }
+    const haystackParts = [name];
+    for (const srv of srvs) {
+      if (srv && srv.environment) haystackParts.push(String(srv.environment));
+      if (srv && srv.extraColumns) {
+        for (const v of Object.values(srv.extraColumns)) {
+          if (v != null && typeof v !== "object") haystackParts.push(String(v));
+        }
+      }
     }
-    return { name, servers: srvs, serverCount: srvs.length, score: envScore + Math.log2(srvs.length + 1) };
+    const haystack = haystackParts.join(" ");
+    const envHint = findPriorityHint(haystack, envPriority);
+    const critHint = findPriorityHint(haystack, critPriority);
+    const envScore = envHint != null ? envHint : 3;
+    const critScore = critHint != null ? critHint : 2;
+    // Lower score = earlier wave. Server count adds a small weight so larger groups
+    // are not all stuffed into the pilot wave.
+    const score = envScore + critScore + Math.log2(srvs.length + 1);
+    return { name, servers: srvs, serverCount: srvs.length, score };
   });
 
-  // Sort by score (lowest = least risky = goes first)
-  scoredGroups.sort((a, b) => a.score - b.score);
+  // Sort by score, then by server count ascending as a tiebreaker.
+  scoredGroups.sort((a, b) => (a.score - b.score) || (a.serverCount - b.serverCount));
 
   // For "even" mode: split the single "All Servers" group into even chunks
   if (groupBy === "even" && scoredGroups.length === 1 && scoredGroups[0].name === "All Servers") {
@@ -2218,13 +3180,12 @@ app.post("/api/waveplan/generate", (req, res) => {
   const wave0Start = new Date(start);
   const wave0End = new Date(wave0Start.getTime() + (lzDesignW + lzProvW + pilotW) * 7 * 86400000);
 
-  // Assign pilot group(s): capped by throughput capacity AND max 3 groups
-  const maxPilotGroups = wavePlanConfig.defaults.pilotMaxGroups || 3;
+  // Assign pilot group(s): fill up to throughput capacity
   const wave0Groups = [];
   let pilotCount = 0;
   const remaining = [...scoredGroups];
 
-  while (remaining.length > 0 && wave0Groups.length < maxPilotGroups && pilotCount + remaining[0].serverCount <= maxPilotVMs) {
+  while (remaining.length > 0 && pilotCount + remaining[0].serverCount <= maxPilotVMs) {
     const g = remaining.shift();
     wave0Groups.push(g);
     pilotCount += g.serverCount;
@@ -2256,18 +3217,74 @@ app.post("/api/waveplan/generate", (req, res) => {
     cumulativeCost: round2(wave0Cost),
   });
 
-  // Distribute remaining groups across migration waves (balanced by server count, respecting throughput cap)
+  // Distribute remaining groups across migration waves preserving risk order.
+  // Industry practice: dev/test in early waves, UAT/staging mid, production/DR in last wave.
   const migrationWaves = [];
   for (let i = 0; i < totalMigrationWaves; i++) migrationWaves.push([]);
 
-  // Greedy distribution: assign next group to wave with fewest servers (soft-balance)
-  for (const g of remaining) {
-    const waveIdx = migrationWaves.reduce((minIdx, wave, idx, arr) => {
-      const minCount = arr[minIdx].reduce((s, x) => s + x.serverCount, 0);
-      const curCount = wave.reduce((s, x) => s + x.serverCount, 0);
-      return curCount < minCount ? idx : minIdx;
-    }, 0);
-    migrationWaves[waveIdx].push(g);
+  if (remaining.length === 0) {
+    // nothing to do
+  } else if (remaining.length <= totalMigrationWaves) {
+    // Few groups: assign exactly one per wave, packed to the END so the highest-risk
+    // group lands in the final wave. Early migration waves may legitimately be empty —
+    // we surface that as a capacity warning so the user can reduce the wave count.
+    const offset = totalMigrationWaves - remaining.length;
+    for (let i = 0; i < remaining.length; i++) migrationWaves[offset + i].push(remaining[i]);
+  } else {
+    // Many groups: slice the score-sorted list into N segments at roughly equal VM-count
+    // midpoints. Order is preserved so risk order is preserved.
+    const totalRemainingVMs = remaining.reduce((s, g) => s + g.serverCount, 0);
+    const targetPerWave = totalRemainingVMs / totalMigrationWaves;
+    let cumVMs = 0;
+    for (const g of remaining) {
+      const midpoint = cumVMs + g.serverCount / 2;
+      let waveIdx = targetPerWave > 0 ? Math.floor(midpoint / targetPerWave) : 0;
+      if (waveIdx >= totalMigrationWaves) waveIdx = totalMigrationWaves - 1;
+      migrationWaves[waveIdx].push(g);
+      cumVMs += g.serverCount;
+    }
+
+    // Eliminate empty waves caused by one wave hogging a contiguous run of groups.
+    // Sweep adjacent waves and re-slice within their range.
+    function eliminateEmptyWaves(buckets) {
+      const N = buckets.length;
+      for (let pass = 0; pass < N; pass++) {
+        let changed = false;
+        for (let i = 0; i < N; i++) {
+          if (buckets[i].length > 0) continue;
+          // Find largest neighbor bucket as donor for re-slicing
+          let donorIdx = -1, donorCount = -1;
+          for (let j = 0; j < N; j++) {
+            if (j === i || buckets[j].length === 0) continue;
+            const c = buckets[j].reduce((s, g) => s + g.serverCount, 0);
+            if (c > donorCount) { donorCount = c; donorIdx = j; }
+          }
+          if (donorIdx === -1) break;
+          const lo = Math.min(i, donorIdx);
+          const hi = Math.max(i, donorIdx);
+          const merged = [];
+          for (let k = lo; k <= hi; k++) merged.push(...buckets[k]);
+          if (merged.length < 2) continue; // can't split a single group
+          const total = merged.reduce((s, g) => s + g.serverCount, 0);
+          const nRange = hi - lo + 1;
+          if (total === 0) continue;
+          const tgt = total / nRange;
+          for (let k = lo; k <= hi; k++) buckets[k] = [];
+          let cum = 0;
+          for (const g of merged) {
+            const mid = cum + g.serverCount / 2;
+            let idx = lo + Math.floor(mid / tgt);
+            if (idx > hi) idx = hi;
+            if (idx < lo) idx = lo;
+            buckets[idx].push(g);
+            cum += g.serverCount;
+          }
+          changed = true;
+        }
+        if (!changed) break;
+      }
+    }
+    eliminateEmptyWaves(migrationWaves);
   }
 
   let cumCost = wave0Cost;
@@ -2302,6 +3319,15 @@ app.post("/api/waveplan/generate", (req, res) => {
     });
 
     currentEnd = new Date(waveEnd.getTime() + bufDays * 86400000);
+  }
+
+  // Warn about empty migration waves (typically: fewer distinct risk groups than waves).
+  const emptyWaves = waves.filter(w => w.waveNumber > 0 && w.totalServers === 0).map(w => w.name);
+  if (emptyWaves.length > 0) {
+    const groupCount = remaining.length + wave0Groups.length;
+    const suggestedWaves = Math.max(1, groupCount - 1); // -1 because wave 0 is pilot
+    const msg = `${emptyWaves.join(", ")} ${emptyWaves.length === 1 ? "is" : "are"} empty because there are only ${groupCount} distinct group(s) for ${totalMigrationWaves + 1} wave(s). Risk-order distribution requires at least one group per wave. Consider reducing wave count to ${suggestedWaves} or choosing a finer "Distribute by" column.`;
+    capacityWarning = capacityWarning ? `${capacityWarning} | ${msg}` : msg;
   }
 
   // Store in session
@@ -2376,6 +3402,18 @@ app.post("/api/waveplan/update", (req, res) => {
   const waveBuckets = {};
   for (let i = 0; i <= numWaves; i++) waveBuckets[i] = [];
 
+  // First pass: collect server-level assignments. These take precedence over the
+  // server's parent group — the group bucket will exclude these specific servers.
+  const serverLevelAssignments = new Map(); // canonicalServerName -> waveIdx
+  for (const [name, waveNum] of Object.entries(assignments)) {
+    const waveIdx = Math.max(0, Math.min(numWaves, parseInt(waveNum) || 0));
+    if (groups[name] || groupsLower[name.toLowerCase().trim()]) continue; // group keys handled in second pass
+    const actualServerName = serverByName[name] ? name : serversLower[name.toLowerCase().trim()];
+    if (actualServerName && serverByName[actualServerName]) {
+      serverLevelAssignments.set(actualServerName, waveIdx);
+    }
+  }
+
   let assignedCount = 0;
   for (const [groupName, waveNum] of Object.entries(assignments)) {
     const waveIdx = Math.max(0, Math.min(numWaves, parseInt(waveNum) || 0));
@@ -2384,10 +3422,12 @@ app.post("/api/waveplan/update", (req, res) => {
     const actualServerName = serverByName[groupName] ? groupName : serversLower[groupName.toLowerCase().trim()];
 
     if (actualGroupName && groups[actualGroupName]) {
-      // Group-level assignment
+      // Group-level assignment — exclude any servers that have their own server-level assignment.
       const meta = (groupMeta && groupMeta[groupName]) || {};
-      waveBuckets[waveIdx].push({ name: actualGroupName, servers: groups[actualGroupName], serverCount: groups[actualGroupName].length, reason: meta.reason || "", tags: meta.tags || {} });
-      assignedCount += groups[actualGroupName].length;
+      const filteredSrvs = groups[actualGroupName].filter(s => !serverLevelAssignments.has(s.serverName));
+      if (filteredSrvs.length === 0) continue; // entire group split out via server-level moves
+      waveBuckets[waveIdx].push({ name: actualGroupName, servers: filteredSrvs, serverCount: filteredSrvs.length, reason: meta.reason || "", tags: meta.tags || {} });
+      assignedCount += filteredSrvs.length;
     } else if (actualServerName && serverByName[actualServerName]) {
       // Server-level assignment (LLM split into individual servers)
       const meta = (groupMeta && groupMeta[groupName]) || {};
@@ -2398,7 +3438,8 @@ app.post("/api/waveplan/update", (req, res) => {
     }
   }
 
-  // If some groups were unassigned (LLM missed them), add them to earliest empty wave or wave 1
+  // If some groups were unassigned (LLM missed them), add them to earliest empty wave or wave 1.
+  // Filter out any servers that were split off via server-level assignments so we don't double-count.
   const allGroupNames = new Set(Object.keys(groups));
   const assignedGroups = new Set();
   for (const bucket of Object.values(waveBuckets)) {
@@ -2406,10 +3447,13 @@ app.post("/api/waveplan/update", (req, res) => {
   }
   for (const unassigned of allGroupNames) {
     if (!assignedGroups.has(unassigned)) {
-      console.warn(`[WavePlan Update] Group "${unassigned}" was not assigned by LLM, adding to wave 1`);
+      const filteredSrvs = groups[unassigned].filter(s => !serverLevelAssignments.has(s.serverName));
+      if (filteredSrvs.length === 0) continue; // entire group was split out individually
+      console.warn(`[WavePlan Update] Group "${unassigned}" was not assigned, adding ${filteredSrvs.length} remaining server(s) to wave 1`);
       const targetWave = Math.min(1, numWaves);
       const meta = {};
-      waveBuckets[targetWave].push({ name: unassigned, servers: groups[unassigned], serverCount: groups[unassigned].length, reason: "Auto-assigned (not in LLM response)", tags: meta });
+      waveBuckets[targetWave].push({ name: unassigned, servers: filteredSrvs, serverCount: filteredSrvs.length, reason: "Auto-assigned (not in response)", tags: meta });
+      assignedCount += filteredSrvs.length;
     }
   }
 
@@ -2449,18 +3493,32 @@ app.post("/api/waveplan/update", (req, res) => {
     const waveCost = waveGroups.reduce((sum, g) => sum + g.servers.reduce((s, srv) => s + (srv.totalMonthlyCost || 0), 0), 0);
     cumCost += waveCost;
 
+    const waveServerCount = waveGroups.reduce((s, g) => s + g.serverCount, 0);
+    const maxWaveVMs = waveDurW * (reqConfig?.waveThroughputPerWeek || wavePlanConfig.defaults.waveThroughputPerWeek || 30);
+    const overCapacity = waveServerCount > maxWaveVMs;
+
     waves.push({
       waveNumber: i, name: `Wave ${i}`,
       startDate: waveStart.toISOString().split("T")[0], endDate: waveEnd.toISOString().split("T")[0],
       durationWeeks: waveDurW,
       groups: waveGroups.map(g => ({ name: g.name, serverCount: g.serverCount, servers: g.servers.map(s => s.serverName), reason: g.reason || "", tags: g.tags || {} })),
-      totalServers: waveGroups.reduce((s, g) => s + g.serverCount, 0),
+      totalServers: waveServerCount,
+      maxCapacity: maxWaveVMs,
+      overCapacity,
       waveCost: round2(waveCost), cumulativeCost: round2(cumCost),
     });
     currentEnd = new Date(waveEnd.getTime() + bufDays * 86400000);
   }
 
-  session.wavePlan = { waves, config };
+  // Generate capacity warning if any wave is overloaded
+  let capacityWarning = null;
+  const overWaves = waves.filter(w => w.overCapacity);
+  if (overWaves.length > 0) {
+    const worst = overWaves.reduce((a, b) => b.totalServers > a.totalServers ? b : a);
+    capacityWarning = `⚠️ ${worst.name} has ${worst.totalServers} VMs but capacity is ${worst.maxCapacity} (${waveDurW} wks × ${reqConfig?.waveThroughputPerWeek || 30}/wk). Consider: increasing wave duration, adding more waves, or splitting constrained groups across multiple late waves.`;
+  }
+
+  session.wavePlan = { waves, config, capacityWarning };
   saveSessionToDisk(sessionId);
   res.json(session.wavePlan);
 });
@@ -2588,16 +3646,46 @@ app.post("/api/waveplan/llm-suggest", async (req, res) => {
     groups[groupName].push(srv);
   }
 
-  const envPriority = wavePlanLogic.autoAssignment.environmentPriority;
-  const scoredGroups = Object.entries(groups).map(([name, srvs]) => {
-    let envScore = 3;
-    const nameLower = name.toLowerCase();
-    for (const [key, val] of Object.entries(envPriority)) {
-      if (nameLower.includes(key)) { envScore = val; break; }
+  // Server-name lookup (for server-level moves when groups are split by tag).
+  const serverByName = {};
+  for (const srv of servers) { serverByName[srv.serverName] = srv; }
+
+  const envPriority = (wavePlanLogic.autoAssignment && wavePlanLogic.autoAssignment.environmentPriority) || {};
+  const critPriority = (wavePlanLogic.autoAssignment && wavePlanLogic.autoAssignment.criticalityPriority) || {};
+
+  function findPriorityHint(haystack, dict) {
+    if (!haystack || !dict) return null;
+    const lower = haystack.toLowerCase();
+    let best = null;
+    for (const [key, val] of Object.entries(dict)) {
+      if (!key) continue;
+      if (lower.includes(key.toLowerCase())) {
+        if (best === null || val > best) best = val; // highest risk wins for a group
+      }
     }
-    return { name, servers: srvs, serverCount: srvs.length, score: envScore + Math.log2(srvs.length + 1) };
+    return best;
+  }
+
+  const scoredGroups = Object.entries(groups).map(([name, srvs]) => {
+    const haystackParts = [name];
+    for (const srv of srvs) {
+      if (srv && srv.environment) haystackParts.push(String(srv.environment));
+      if (srv && srv.extraColumns) {
+        for (const v of Object.values(srv.extraColumns)) {
+          if (v != null && typeof v !== "object") haystackParts.push(String(v));
+        }
+      }
+    }
+    const haystack = haystackParts.join(" ");
+    const envHint = findPriorityHint(haystack, envPriority);
+    const critHint = findPriorityHint(haystack, critPriority);
+    const envScore = envHint != null ? envHint : 3;
+    const critScore = critHint != null ? critHint : 2;
+    // Lower score = earlier wave. Production (envScore=5) naturally ends up last.
+    const score = envScore + critScore + Math.log2(srvs.length + 1);
+    return { name, servers: srvs, serverCount: srvs.length, score };
   });
-  scoredGroups.sort((a, b) => a.score - b.score);
+  scoredGroups.sort((a, b) => (a.score - b.score) || (a.serverCount - b.serverCount));
 
   const totalMigrationWaves = numWaves || wavePlanConfig.defaults.numMigrationWaves || 3;
   const pilotThroughput = pilotThroughputPerWeek || wavePlanConfig.defaults.pilotThroughputPerWeek || 10;
@@ -2628,40 +3716,111 @@ app.post("/api/waveplan/llm-suggest", async (req, res) => {
     baseAssignment[g.name] = 0;
   }
 
-  // Distribute remaining across migration waves (greedy balanced)
+  // Distribute remaining across migration waves preserving risk order (industry practice:
+  // production/critical groups land in later waves). See /api/waveplan/generate for the
+  // detailed strategy — same logic applies here.
   const migrationBuckets = [];
   for (let i = 0; i < totalMigrationWaves; i++) migrationBuckets.push([]);
 
-  for (const g of remaining) {
-    const waveIdx = migrationBuckets.reduce((minIdx, wave, idx, arr) => {
-      const minCount = arr[minIdx].reduce((s, x) => s + x.serverCount, 0);
-      const curCount = wave.reduce((s, x) => s + x.serverCount, 0);
-      return curCount < minCount ? idx : minIdx;
-    }, 0);
-    migrationBuckets[waveIdx].push(g);
-    baseAssignment[g.name] = waveIdx + 1; // wave 1-indexed
+  if (remaining.length === 0) {
+    // nothing to do
+  } else if (remaining.length <= totalMigrationWaves) {
+    // Few groups: one per wave, end-justified so highest-risk lands in the last wave.
+    const offset = totalMigrationWaves - remaining.length;
+    for (let i = 0; i < remaining.length; i++) {
+      migrationBuckets[offset + i].push(remaining[i]);
+      baseAssignment[remaining[i].name] = offset + i + 1;
+    }
+  } else {
+    // Many groups: midpoint slicing, then eliminate empty waves by re-slicing adjacent ranges.
+    const totalRemainingVMs = remaining.reduce((s, g) => s + g.serverCount, 0);
+    const targetPerWave = totalRemainingVMs / totalMigrationWaves;
+    let cumVMs = 0;
+    for (const g of remaining) {
+      const midpoint = cumVMs + g.serverCount / 2;
+      let waveIdx = targetPerWave > 0 ? Math.floor(midpoint / targetPerWave) : 0;
+      if (waveIdx >= totalMigrationWaves) waveIdx = totalMigrationWaves - 1;
+      migrationBuckets[waveIdx].push(g);
+      cumVMs += g.serverCount;
+    }
+    // Re-slice ranges containing empty waves
+    const N = migrationBuckets.length;
+    for (let pass = 0; pass < N; pass++) {
+      let changed = false;
+      for (let i = 0; i < N; i++) {
+        if (migrationBuckets[i].length > 0) continue;
+        let donorIdx = -1, donorCount = -1;
+        for (let j = 0; j < N; j++) {
+          if (j === i || migrationBuckets[j].length === 0) continue;
+          const c = migrationBuckets[j].reduce((s, g) => s + g.serverCount, 0);
+          if (c > donorCount) { donorCount = c; donorIdx = j; }
+        }
+        if (donorIdx === -1) break;
+        const lo = Math.min(i, donorIdx);
+        const hi = Math.max(i, donorIdx);
+        const merged = [];
+        for (let k = lo; k <= hi; k++) merged.push(...migrationBuckets[k]);
+        if (merged.length < 2) continue;
+        const total = merged.reduce((s, g) => s + g.serverCount, 0);
+        const nRange = hi - lo + 1;
+        const tgt = total / nRange;
+        for (let k = lo; k <= hi; k++) migrationBuckets[k] = [];
+        let cum = 0;
+        for (const g of merged) {
+          const mid = cum + g.serverCount / 2;
+          let idx = lo + Math.floor(mid / tgt);
+          if (idx > hi) idx = hi;
+          if (idx < lo) idx = lo;
+          migrationBuckets[idx].push(g);
+          cum += g.serverCount;
+        }
+        changed = true;
+      }
+      if (!changed) break;
+    }
+    // Materialize baseAssignment from final bucket layout
+    for (let i = 0; i < migrationBuckets.length; i++) {
+      for (const g of migrationBuckets[i]) baseAssignment[g.name] = i + 1;
+    }
   }
 
   console.log(`[WavePlan] Rule-based assignment:`, JSON.stringify(baseAssignment));
 
   // ===== STEP 2: Ask LLM for refinements based on user instructions =====
-  // Collect metadata for each group
-  const metadataColumns = ["Tier", "Environment", "Criticality", "Priority", "Risk", "Classification", "App Tier", "Business Criticality"];
+  // Collect metadata for each group. We do NOT hardcode any column names — every
+  // categorical extra column the inventory provides is exposed to the LLM as a tag,
+  // except hardware/infra columns that are not relevant to wave planning.
+  const tagExcludePatterns = /^(cpu|cores|vcpu|ram|memory|disk|storage|manufacturer|model|serial|ip|mac|uuid|bios|firmware|os\s*version|os\s*type|kernel|hostname|fqdn|domain|size|capacity|speed|frequency|architecture|processor|nic|network.*adapter|interface|port|slot|power|height|rack|datacenter|physical|virtual|cluster|host)/i;
+  const groupColLower = (groupColumn || "").toString().trim().toLowerCase();
+  function isCandidateTagColumn(col) {
+    if (!col) return false;
+    const c = col.trim();
+    if (tagExcludePatterns.test(c)) return false;
+    // Exclude the column used as the group key itself (e.g. "Business Application")
+    // because its value is just the group name and adds no signal.
+    if (groupColLower && c.toLowerCase() === groupColLower) return false;
+    return true;
+  }
   const groupDescriptions = Object.entries(groups).map(([name, srvs]) => {
     const metadata = {};
     for (const srv of srvs) {
       if (srv.extraColumns) {
         for (const col of Object.keys(srv.extraColumns)) {
-          if (metadataColumns.some(mc => col.toLowerCase().includes(mc.toLowerCase()))) {
-            if (!metadata[col]) metadata[col] = new Set();
-            if (srv.extraColumns[col]) metadata[col].add(srv.extraColumns[col]);
-          }
+          if (!isCandidateTagColumn(col)) continue;
+          const val = srv.extraColumns[col];
+          if (val == null || val === "") continue;
+          if (!metadata[col]) metadata[col] = new Set();
+          metadata[col].add(val);
         }
       }
       if (srv.environment) {
-        if (!metadata["Environment"]) metadata["Environment"] = new Set();
-        metadata["Environment"].add(srv.environment);
+        if (!metadata["environment"]) metadata["environment"] = new Set();
+        metadata["environment"].add(srv.environment);
       }
+    }
+    // Drop tags whose cardinality is too high to be useful as a grouping signal.
+    for (const k of Object.keys(metadata)) {
+      if (metadata[k].size > 50) delete metadata[k];
     }
     const metaStr = Object.entries(metadata).map(([col, vals]) => `${col}=[${[...vals].join(",")}]`).join(", ");
     return `- "${name}" (${srvs.length} servers, currently wave ${baseAssignment[name]})${metaStr ? ` | ${metaStr}` : ""}`;
@@ -2679,53 +3838,104 @@ Based on the user's instructions, which groups/servers need to be MOVED to a dif
 Only return moves that are necessary to satisfy the user's instructions. If no moves are needed, return an empty array.
 
 Return ONLY a JSON array of moves:
-[{"group": "GroupName", "toWave": 3, "reason": "User instructed Tier 1 to last wave"}]
+[{"group": "<exact group name from the list above>", "toWave": <integer>, "reason": "<short reason citing the matching tag/value>"}]
 
 Rules:
-- Wave numbers must be between 0 and ${totalMigrationWaves}
-- "last wave" means wave ${totalMigrationWaves}
-- "first wave" means wave 1 (wave 0 is always pilot)
-- Only move groups that match the user's criteria
-- Return ONLY the JSON array, no other text`;
+- Use only group names that appear in the list above. Do not invent names.
+- Match the user's instructions to groups by their tag values (e.g. any column they mention).
+- Do not assume any specific tag vocabulary — different inventories use different conventions.
+- Wave numbers must be integers between 0 and ${totalMigrationWaves}.
+- "last wave" means wave ${totalMigrationWaves}.
+- "first wave" means wave 1 (wave 0 is always pilot).
+- Only move groups that match the user's criteria; otherwise return [].
+- Return ONLY the JSON array, no other text.`;
 
   let moves = [];
+
+  // Helper: extract JSON array from free-form LLM text
+  function extractJsonArrayFromText(text) {
+    if (!text || typeof text !== 'string') return null;
+    // Try direct parse
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === 'object') {
+        const arr = Object.values(parsed).find(v => Array.isArray(v));
+        if (arr) return arr;
+      }
+    } catch (e) {}
+    // Regex: first top-level array or object
+    const m = text.match(/(\[[\s\S]*?\]|\{[\s\S]*?\})/);
+    if (m && m[0]) {
+      try {
+        const parsed = JSON.parse(m[0]);
+        if (Array.isArray(parsed)) return parsed;
+        if (parsed && typeof parsed === 'object') {
+          const arr = Object.values(parsed).find(v => Array.isArray(v));
+          if (arr) return arr;
+        }
+      } catch (e) {}
+    }
+    // Try moves property
+    const movesMatch = text.match(/"moves"\s*:\s*(\[[\s\S]*?\])/i);
+    if (movesMatch && movesMatch[1]) {
+      try { const parsed = JSON.parse(movesMatch[1]); if (Array.isArray(parsed)) return parsed; } catch (e) {}
+    }
+    return null;
+  }
+
   try {
-    const response = await llmHelper.call(
+    // Call LLM and capture raw response for robust parsing
+    let rawResponse = await llmHelper.call(
       "You are a migration planning assistant. Your job is to interpret the user's instructions and determine which server groups need to be moved to different waves. Return ONLY a JSON array of moves. If no moves needed, return []. NEVER ask questions.",
       refinementPrompt,
-      { json: true, maxTokens: 4000, timeout: 45000 }
+      { maxTokens: 4000, timeout: 120000 }
     );
+    rawResponseText = (typeof rawResponse === 'string' ? rawResponse : JSON.stringify(rawResponse));
 
-    if (response && Array.isArray(response)) {
-      moves = response;
-    } else if (response && typeof response === "object" && !Array.isArray(response)) {
-      // Try to extract array from object
-      const arrProp = Object.values(response).find(v => Array.isArray(v));
+    // Log raw response for debugging
+    try {
+      console.log(`[WavePlan] Raw LLM response (initial, truncated):`, rawResponseText.substring(0, 4000));
+    } catch (e) { /* ignore logging issues */ }
+
+    // Parsed response may already be an array/object
+    if (Array.isArray(rawResponse)) moves = rawResponse;
+    else if (rawResponse && typeof rawResponse === 'object') {
+      const arrProp = Object.values(rawResponse).find(v => Array.isArray(v));
       if (arrProp) moves = arrProp;
+      else {
+        const asText = JSON.stringify(rawResponse);
+        const extracted = extractJsonArrayFromText(asText);
+        if (extracted) moves = extracted;
+      }
+    } else if (typeof rawResponse === 'string') {
+      const extracted = extractJsonArrayFromText(rawResponse);
+      if (extracted) moves = extracted;
     }
-    console.log(`[WavePlan] LLM suggested ${moves.length} moves:`, JSON.stringify(moves));
+
+    console.log(`[WavePlan] LLM suggested ${moves.length} moves after parsing:`, JSON.stringify(moves));
   } catch (err) {
-    console.warn(`[WavePlan] LLM refinement failed (using rule-based): ${err.message}`);
-    // Continue with rule-based — this is fine
+    console.warn(`[WavePlan] LLM refinement failed (using rule-based): ${err && err.message ? err.message : err}`);
+    if (err && err.stack) console.warn(err.stack);
   }
 
   // ===== STEP 3: Apply LLM moves on top of rule-based assignment =====
   const finalAssignment = { ...baseAssignment };
   const groupMeta = {};
 
-  // Always populate groupMeta with tags (Tier, Environment, etc.) for display in AI Insight column
+  // Populate groupMeta with all categorical tags discovered from the inventory.
+  // We do NOT hardcode any column names — every extra column that is not a hardware/infra
+  // attribute is treated as a customer-defined tag the LLM can use for matching.
   for (const [name, srvs] of Object.entries(groups)) {
     const tags = {};
     for (const srv of srvs) {
       if (srv.extraColumns) {
         for (const col of Object.keys(srv.extraColumns)) {
-          if (metadataColumns.some(mc => col.toLowerCase().includes(mc.toLowerCase()))) {
-            const val = srv.extraColumns[col];
-            if (val) {
-              if (!tags[col]) tags[col] = new Set();
-              tags[col].add(val);
-            }
-          }
+          if (!isCandidateTagColumn(col)) continue;
+          const val = srv.extraColumns[col];
+          if (val == null || val === "") continue;
+          if (!tags[col]) tags[col] = new Set();
+          tags[col].add(val);
         }
       }
       if (srv.environment) {
@@ -2733,7 +3943,10 @@ Rules:
         tags["environment"].add(srv.environment);
       }
     }
-    // Convert sets to joined strings
+    // Drop high-cardinality tags (e.g. server names) that aren't useful for grouping.
+    for (const k of Object.keys(tags)) {
+      if (tags[k].size > 50) delete tags[k];
+    }
     const flatTags = {};
     for (const [k, v] of Object.entries(tags)) { flatTags[k.toLowerCase()] = [...v].join(", "); }
     groupMeta[name] = { reason: "", tags: flatTags };
@@ -2743,22 +3956,405 @@ Rules:
   const groupsLower = {};
   for (const key of Object.keys(groups)) { groupsLower[key.toLowerCase().trim()] = key; }
 
-  for (const move of moves) {
-    if (!move.group || move.toWave === undefined) continue;
-    const toWave = Math.max(0, Math.min(totalMigrationWaves, parseInt(move.toWave) || 0));
-    // Match group name (case-insensitive)
-    const actualName = groups[move.group] ? move.group : groupsLower[move.group.toLowerCase().trim()];
-    if (actualName) {
-      finalAssignment[actualName] = toWave;
-      groupMeta[actualName].reason = move.reason || `Moved from wave ${baseAssignment[actualName]} → ${toWave}`;
-      console.log(`[WavePlan] Moved "${actualName}" from wave ${baseAssignment[actualName]} → wave ${toWave} (${move.reason})`);
-    } else {
-      console.warn(`[WavePlan] LLM suggested moving "${move.group}" but no matching group found`);
+  function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function matchGroupMetaToText(text, meta) {
+    if (!text || !meta || !meta.tags) return false;
+    const lowerText = text.toString().toLowerCase();
+
+    for (const [tagKey, rawTagValue] of Object.entries(meta.tags)) {
+      const key = (tagKey || "").toString().toLowerCase().trim();
+      const rawValue = (rawTagValue || "").toString().toLowerCase().trim();
+      if (!rawValue) continue;
+
+      // Values may be comma-joined lists from multiple servers in the group; check each.
+      const valueParts = rawValue.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+      const keyTokens = key.split(/\W+/).filter(Boolean);
+
+      for (const value of valueParts) {
+        if (!value) continue;
+        const escapedValue = escapeRegExp(value);
+
+        // (a) Phrase match: full key adjacent to value, e.g. "system tier 1" or "1 system tier".
+        if (key && (lowerText.includes(`${key} ${value}`) || lowerText.includes(`${value} ${key}`))) {
+          return true;
+        }
+
+        // (b) Key-token + value, with or without space, e.g. "tier1", "tier 1", "tier-1".
+        //     Requires at least one significant key token (>=3 chars) so we don't
+        //     match generic prepositions/articles.
+        for (const kt of keyTokens) {
+          if (!kt || kt.length < 3) continue;
+          const reConcat = new RegExp(`\\b${escapeRegExp(kt)}[\\s\\-_]*${escapedValue}(?![a-z0-9])`, "i");
+          if (reConcat.test(lowerText)) {
+            return true;
+          }
+        }
+
+        // (c) Whole-word match of the value alone, but only for values long enough
+        //     to be unambiguous (>=3 chars). Skips bare digits like "1"/"2"/"+".
+        if (value.length >= 3) {
+          const reWhole = new RegExp(`\\b${escapedValue}\\b`, "i");
+          if (reWhole.test(lowerText)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // Helper: resolve move.group text to one or more actual group names.
+  function resolveMoveTargets(groupText) {
+    if (!groupText) return [];
+    const txt = (groupText || "").toString().trim();
+    if (!txt) return [];
+    // Exact name match
+    if (groups[txt]) return [txt];
+    const lookup = groupsLower[txt.toLowerCase()];
+    if (lookup) return [lookup];
+
+    const lower = txt.toLowerCase();
+    const results = new Set();
+
+    for (const [gName, meta] of Object.entries(groupMeta)) {
+      if (matchGroupMetaToText(lower, meta)) {
+        results.add(gName);
+      }
+    }
+    if (results.size) return [...results];
+
+    // Fallback: substring match against group names
+    for (const gName of Object.keys(groups)) {
+      if (gName.toLowerCase().includes(lower)) results.add(gName);
+    }
+    return [...results];
+  }
+
+  // Apply moves. The LLM may target multiple groups if its move references a tag value
+  // (e.g. any customer-defined tag). resolveMoveTargets() handles that mapping generically.
+  const movedGroupNames = new Set();
+  const movedServerNames = new Set();
+
+  // Extract concrete (tagKey, tagValue) filters that the user's instruction references.
+  // We enumerate every distinct (key, value) pair found in the inventory and test it
+  // against the same matching rules used for groups. This way "Tier 1 last wave" yields
+  // {key: "system tier", value: "1"} and we can split heterogeneous groups per server.
+  function extractTagFiltersFromInstructions(text) {
+    const lower = (text || "").toString().toLowerCase();
+    const filters = [];
+    if (!lower) return filters;
+    const seen = new Set();
+    for (const meta of Object.values(groupMeta)) {
+      if (!meta || !meta.tags) continue;
+      for (const [k, joinedV] of Object.entries(meta.tags)) {
+        const key = (k || "").toLowerCase().trim();
+        if (!key) continue;
+        const keyTokens = key.split(/\W+/).filter(t => t && t.length >= 3);
+        for (const part of String(joinedV || "").split(/\s*,\s*/)) {
+          const value = part.trim().toLowerCase();
+          if (!value) continue;
+          const id = `${key}::${value}`;
+          if (seen.has(id)) continue;
+          const escapedValue = escapeRegExp(value);
+          let hit = false;
+          if (lower.includes(`${key} ${value}`) || lower.includes(`${value} ${key}`)) hit = true;
+          if (!hit) {
+            for (const kt of keyTokens) {
+              const re = new RegExp(`\\b${escapeRegExp(kt)}[\\s\\-_]*${escapedValue}(?![a-z0-9])`, "i");
+              if (re.test(lower)) { hit = true; break; }
+            }
+          }
+          if (!hit && value.length >= 3) {
+            const re = new RegExp(`\\b${escapedValue}\\b`, "i");
+            if (re.test(lower)) hit = true;
+          }
+          if (hit) { filters.push({ key, value }); seen.add(id); }
+        }
+      }
+    }
+    return filters;
+  }
+
+  // True if the server's tags satisfy ANY of the supplied {key, value} filters.
+  function serverMatchesAnyFilter(srv, filters) {
+    if (!filters || !filters.length) return false;
+    for (const f of filters) {
+      let val = null;
+      if (f.key === "environment") {
+        val = srv.environment;
+      } else if (srv.extraColumns) {
+        for (const col of Object.keys(srv.extraColumns)) {
+          if (col.toLowerCase() === f.key) { val = srv.extraColumns[col]; break; }
+        }
+      }
+      if (val == null) continue;
+      if (String(val).toLowerCase().trim() === f.value) return true;
+    }
+    return false;
+  }
+
+  // Apply a tag-driven directive ("last wave" or "first wave") by splitting groups:
+  //  - If ALL servers in a group match the filter set, queue a whole-group move.
+  //  - If only SOME match, queue server-level moves so we don't displace unrelated servers.
+  function applyTagDirective(directiveLabel, targetWave) {
+    const filters = extractTagFiltersFromInstructions(instructionText);
+    if (filters.length === 0) {
+      console.log(`[WavePlan] ${directiveLabel}: no tag filters extracted from instruction; skipping fallback.`);
+      return;
+    }
+    console.log(`[WavePlan] ${directiveLabel}: tag filters extracted ->`, JSON.stringify(filters));
+    let wholeGroupMoves = 0;
+    let serverMoves = 0;
+    for (const [gName, srvs] of Object.entries(groups)) {
+      const matching = srvs.filter(s => serverMatchesAnyFilter(s, filters));
+      if (matching.length === 0) continue;
+      if (matching.length === srvs.length) {
+        if (!moves.some(m => m.group === gName)) {
+          moves.push({ group: gName, toWave: targetWave, reason: `${directiveLabel} (all ${srvs.length} servers match filter)` });
+          wholeGroupMoves++;
+        }
+      } else {
+        for (const s of matching) {
+          if (!moves.some(m => m.group === s.serverName)) {
+            moves.push({ group: s.serverName, toWave: targetWave, reason: `${directiveLabel} (server matches tag filter; group "${gName}" stays put for non-matching servers)` });
+            serverMoves++;
+          }
+        }
+      }
+    }
+    console.log(`[WavePlan] ${directiveLabel}: queued ${wholeGroupMoves} whole-group move(s) and ${serverMoves} server-level move(s).`);
+  }
+
+  const instructionText = (userInstructions || "").toString().toLowerCase();
+  const isLastWaveDirective = /(last\s+wave|last\s+waves|final\s+wave|final\s+phase|end\s+wave|later\s+wave|move.*last|put.*last|push.*end|delay.*end|delay.*last|defer.*last)/.test(instructionText);
+  const isFirstWaveDirective = /(first\s+wave|wave\s*0|wave\s*zero|pilot\s+wave|pilot\s+phase|early\s+wave|to\s+pilot|in\s+pilot|move.*first|put.*first|move.*pilot|put.*pilot)/.test(instructionText);
+
+  if (isLastWaveDirective) {
+    applyTagDirective("last-wave", totalMigrationWaves);
+  }
+  if (isFirstWaveDirective) {
+    applyTagDirective("first-wave", 0);
+  }
+
+  // If moves are empty or ambiguous (hints instead of exact group names), ask the LLM to refine
+  const isAmbiguous = (!moves || moves.length === 0) || moves.some(m => {
+    try { return resolveMoveTargets(m.group).length !== 1; } catch { return true; }
+  });
+
+  if (isAmbiguous && llmHelper.isConfigured()) {
+    try {
+      // Build explicit group list with tags to give the LLM exact choices
+      const groupsList = Object.keys(groupMeta).map(name => {
+        const tags = groupMeta[name].tags || {};
+        const tagStr = Object.entries(tags).map(([k, v]) => `${k}=${v}`).join(", ");
+        return `- "${name}" | ${tagStr}`;
+      }).join("\n");
+
+      const refinePrompt2 = `You are a migration planning assistant. The user gave free-text instructions: "${userInstructions}".\n` +
+        `We have the following groups (name and tags):\n${groupsList}\n` +
+        `Earlier you returned: ${JSON.stringify(moves || [])} .\n` +
+        `Now, MAP any hints or tags from the user's instructions to the EXACT group NAMES above and RETURN ONLY a JSON array of moves in the form:` +
+        `[ { "group": "Exact Group Name", "toWave": 0-` + totalMigrationWaves + `, "reason": "explain briefly" } ]\n` +
+        `Rules: use only group names from the list above (do not invent names), ensure group names match exactly (including punctuation), wave numbers must be integers between 0 and ${totalMigrationWaves}, and return only the JSON array.`;
+
+      // Call refinement LLM and robustly parse result (log raw text for debugging)
+      const refinedRaw = await llmHelper.call(
+        "You are a strict JSON-output assistant. Map hints to exact group names from the provided list and output only a JSON array of moves.",
+        refinePrompt2,
+        { maxTokens: 2000, timeout: 120000 }
+      );
+
+      refinedRawText = (typeof refinedRaw === 'string' ? refinedRaw : JSON.stringify(refinedRaw));
+      try {
+        console.log(`[WavePlan] Raw LLM refinement response (truncated):`, refinedRawText.substring(0, 4000));
+      } catch (e) {}
+
+      if (Array.isArray(refinedRaw)) {
+        moves = refinedRaw;
+      } else if (refinedRaw && typeof refinedRaw === 'object') {
+        const arr = Object.values(refinedRaw).find(v => Array.isArray(v));
+        if (Array.isArray(arr) && arr.length > 0) moves = arr;
+        else {
+          const asText = JSON.stringify(refinedRaw);
+          const extracted = extractJsonArrayFromText(asText);
+          if (extracted) moves = extracted;
+        }
+      } else if (typeof refinedRaw === 'string') {
+        const extracted = extractJsonArrayFromText(refinedRaw);
+        if (extracted) moves = extracted;
+      }
+
+      if (moves && moves.length > 0) console.log(`[WavePlan] LLM refinement returned ${moves.length} moves after parsing.`);
+    } catch (err) {
+      console.warn(`[WavePlan] LLM refinement failed: ${err.message}`);
+      // fall back to original moves (may be empty)
     }
   }
 
+  // If debug requested, persist raw/refined responses now (we have variables in-scope)
+  if (req.body && req.body.debugRaw) {
+    try {
+      const dump = {
+        timestamp: new Date().toISOString(),
+        rawResponse: rawResponseText || null,
+        refinedResponse: refinedRawText || null,
+        movesParsed: moves || [],
+        prompt: refinementPrompt,
+      };
+      // Persist to in-memory session for retrieval via debug endpoint
+      if (session) session.lastLLM = dump;
+      console.log(`[WavePlan] Debug LLM dump attached to session: ${sessionId}`);
+    } catch (e) {
+      console.warn(`[WavePlan] Failed to write debug LLM dump: ${e.message}`);
+      debugFilePath = null;
+    }
+  }
+
+  // Now apply moves to resolved targets
+  for (const move of moves || []) {
+    if (!move.group || move.toWave === undefined) continue;
+    const toWave = Math.max(0, Math.min(totalMigrationWaves, parseInt(move.toWave) || 0));
+
+    // Server-level move (matches an exact server name) — used when a group was split.
+    if (serverByName[move.group]) {
+      finalAssignment[move.group] = toWave;
+      movedServerNames.add(move.group);
+      // Carry an inline tag snapshot for that single server so the UI can show it.
+      const srv = serverByName[move.group];
+      const tags = {};
+      if (srv.environment) tags["environment"] = srv.environment;
+      if (srv.extraColumns) {
+        for (const col of Object.keys(srv.extraColumns)) {
+          if (!isCandidateTagColumn(col)) continue;
+          const v = srv.extraColumns[col];
+          if (v != null && v !== "") tags[col.toLowerCase()] = String(v);
+        }
+      }
+      groupMeta[move.group] = { reason: move.reason || "", tags };
+      console.log(`[WavePlan] Moved server "${move.group}" → wave ${toWave} (${move.reason})`);
+      continue;
+    }
+
+    const targets = resolveMoveTargets(move.group);
+    if (!targets || targets.length === 0) {
+      console.warn(`[WavePlan] LLM suggested moving "${move.group}" but no matching group(s) found`);
+      continue;
+    }
+    for (const actualName of targets) {
+      finalAssignment[actualName] = toWave;
+      movedGroupNames.add(actualName);
+      if (!groupMeta[actualName]) groupMeta[actualName] = { reason: "", tags: {} };
+      groupMeta[actualName].reason = move.reason || `Moved from wave ${baseAssignment[actualName] || 'N/A'} → ${toWave}`;
+      console.log(`[WavePlan] Moved "${actualName}" from wave ${baseAssignment[actualName] || 'N/A'} → wave ${toWave} (${move.reason})`);
+    }
+  }
+
+  // ===== STEP 4: Rebalance non-constrained groups after moves =====
+  // Identify which groups were moved (hard constraints) vs not moved (soft, rebalanceable)
+
+  if (movedGroupNames.size > 0 || movedServerNames.size > 0) {
+    // Separate constrained vs soft groups
+    const constrainedWaveLoads = {}; // waveNum -> total server count from constrained groups/servers
+    const softGroups = []; // groups that can be rebalanced
+
+    for (const [name, wave] of Object.entries(finalAssignment)) {
+      if (movedServerNames.has(name)) {
+        // Server-level constraint — stays where it was placed.
+        constrainedWaveLoads[wave] = (constrainedWaveLoads[wave] || 0) + 1;
+        continue;
+      }
+      if (!groups[name]) continue; // unknown / orphan
+      // Effective server count: subtract any servers from this group that were split out.
+      const splitOut = groups[name].filter(s => movedServerNames.has(s.serverName)).length;
+      const effectiveCount = groups[name].length - splitOut;
+      if (effectiveCount <= 0) continue; // entire group split out; nothing left to schedule
+      if (movedGroupNames.has(name)) {
+        constrainedWaveLoads[wave] = (constrainedWaveLoads[wave] || 0) + effectiveCount;
+      } else {
+        softGroups.push({ name, serverCount: effectiveCount });
+      }
+    }
+
+    // Redistribute soft groups across all waves, considering constrained loads
+    // Target: balance total VMs per wave as evenly as possible
+    const totalSoftVMs = softGroups.reduce((s, g) => s + g.serverCount, 0);
+    const idealPerWave = Math.ceil(totalSoftVMs / (totalMigrationWaves + 1)); // +1 for wave 0
+
+    // Sort soft groups by size descending for best-fit packing
+    softGroups.sort((a, b) => b.serverCount - a.serverCount);
+
+    // Calculate available space per wave (total target minus constrained load)
+    const waveLoads = {};
+    for (let i = 0; i <= totalMigrationWaves; i++) {
+      waveLoads[i] = constrainedWaveLoads[i] || 0;
+    }
+
+    // Greedy assignment: put each soft group in the wave with the least total load
+    for (const g of softGroups) {
+      // Find wave with minimum current load (prefer non-zero waves if possible to leave pilot light)
+      let bestWave = 1;
+      let bestLoad = Infinity;
+      for (let i = 0; i <= totalMigrationWaves; i++) {
+        // Slightly penalize wave 0 to keep pilot lighter
+        const effectiveLoad = waveLoads[i] + (i === 0 ? idealPerWave * 0.3 : 0);
+        if (effectiveLoad < bestLoad) {
+          bestLoad = effectiveLoad;
+          bestWave = i;
+        }
+      }
+      finalAssignment[g.name] = bestWave;
+      waveLoads[bestWave] += g.serverCount;
+    }
+
+    // Log rebalanced distribution (uses effective counts: server-level entries count as 1,
+    // group-level entries subtract any split-out servers).
+    const waveSummary = {};
+    for (const [name, wave] of Object.entries(finalAssignment)) {
+      let count;
+      if (movedServerNames.has(name)) count = 1;
+      else if (groups[name]) count = groups[name].filter(s => !movedServerNames.has(s.serverName)).length;
+      else count = 0;
+      waveSummary[wave] = (waveSummary[wave] || 0) + count;
+    }
+    console.log(`[WavePlan] Rebalanced distribution:`, JSON.stringify(waveSummary));
+  }
+
   // Build response in format expected by /api/waveplan/update
-  res.json({ assignments: finalAssignment, groupMeta, moves, baseAssignment });
+  const responsePayload = { assignments: finalAssignment, groupMeta, moves, baseAssignment };
+  // If client requested debugRaw, include raw LLM text for debugging
+  if (req.body && req.body.debugRaw) {
+    try {
+      // Persist raw responses to a debug file for full inspection (avoids JSON serialization issues)
+      try {
+        const debugDir = SESSIONS_DIR;
+        const debugPath = path.join(debugDir, `${sessionId}_llm_raw.txt`);
+        const dump = {
+          timestamp: new Date().toISOString(),
+          rawResponse: rawResponseText || null,
+          refinedResponse: typeof refinedRawText !== 'undefined' ? refinedRawText : null,
+          movesParsed: moves || [],
+        };
+        fs.writeFileSync(debugPath, JSON.stringify(dump, null, 2), 'utf-8');
+        responsePayload._debug = { debugFile: debugPath };
+      } catch (e) {
+        responsePayload._debug = { error: 'failed to persist raw debug file' };
+      }
+    } catch (e) {
+      responsePayload._debug = { error: 'failed to attach raw debug texts' };
+    }
+  }
+  res.json(responsePayload);
+});
+
+// Debug: retrieve last LLM dump for a session
+app.get('/api/waveplan/llm-debug/:sessionId', (req, res) => {
+  const s = sessions[req.params.sessionId];
+  if (!s) return res.status(404).json({ error: 'session not found' });
+  if (!s.lastLLM) return res.status(404).json({ error: 'no llm dump available for this session' });
+  res.json(s.lastLLM);
 });
 
 // ============ XLSX EXPORT ENDPOINTS ============

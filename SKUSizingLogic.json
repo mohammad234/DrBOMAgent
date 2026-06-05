@@ -9,9 +9,9 @@
   },
 
   "rightSizing": {
-    "mode": "as-allocated",
-    "_modeOptions": ["as-allocated", "performance-based"],
-    "_note": "Azure Migrate used as-allocated for this inventory because no utilization data was present. Switch to performance-based only when CPU%/RAM% utilization telemetry is available.",
+    "mode": "auto",
+    "_modeOptions": ["as-allocated", "performance-based", "auto"],
+    "_note": "auto = per-row: use performance-based when CPU/Memory utilization columns are present and valid for that row, else fall back to as-allocated. This matches Azure Migrate behaviour.",
     "asAllocated": {
       "cpuComfortFactor": 1.0,
       "ramComfortFactor": 1.0
@@ -21,7 +21,11 @@
       "ramUtilizationPercentile": 95,
       "cpuComfortFactor": 1.3,
       "ramComfortFactor": 1.3,
-      "_note": "requiredCores = ceil(observedCores * cpuPercentileUtil * cpuComfortFactor); same pattern for RAM."
+      "minimumUtilizationPercent": 20,
+      "maximumUtilizationPercent": 100,
+      "treatZeroAs": "as-allocated",
+      "treatMissingAs": "as-allocated",
+      "_note": "Industry-standard formula (Azure Migrate aligned): requiredCores = ceil(observedCores * (max(observedCpu%, minimumUtilizationPercent) / 100) * cpuComfortFactor). Same pattern for RAM. Edge-case rules: (1) utilization == 0 OR missing -> fall back to as-allocated for that row (server may have been off / agent broken / measurement window too short - undersizing risk is real). (2) utilization < minimumUtilizationPercent (20%) -> floor to 20% (idle workloads still need baseline capacity to handle bursts and OS overhead). (3) utilization > 100% -> cap at 100% (measurement quirk). Percentile (95th) is taken from the source telemetry by Azure Migrate; this agent uses whatever single value the inventory provides as already representing that percentile."
     }
   },
 

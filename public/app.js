@@ -62,8 +62,23 @@ function closePanel() {
   } catch (e) {
     console.log("Auth check skipped:", e.message);
   }
-  // LLM badge only shows when user explicitly selects endpoint+deployment in config panel
-  // Do NOT auto-activate from saved config or server memory
+  // Sync UI with backend LLM state. Backend retains config across browser refreshes;
+  // without this, the UI hides the AI Optimization toggle but the (HTML-default-checked)
+  // checkbox still tells the server to run LLM. Read /api/llm/status, and if configured
+  // reveal the toggle (kept OFF by default — user opts in explicitly).
+  try {
+    const llmRes = await fetch("/api/llm/status");
+    const llmStatus = await llmRes.json();
+    if (llmStatus && llmStatus.configured) {
+      state.llmConfigured = true;
+      const llmOptContainer = document.getElementById("llmOptToggleContainer");
+      const llmOptToggle = document.getElementById("llmOptToggle");
+      if (llmOptContainer) llmOptContainer.classList.remove("hidden");
+      if (llmOptToggle) llmOptToggle.checked = false;
+    }
+  } catch (e) {
+    console.log("LLM status check skipped:", e.message);
+  }
 })();
 
 function setAzureConnected(connected) {
@@ -93,16 +108,20 @@ function setLlmConnected(configured) {
   const badge = document.getElementById("agenticModeLabel");
   const toggle = document.getElementById("aiModeToggle");
   const llmOptContainer = document.getElementById("llmOptToggleContainer");
+  const llmOptToggle = document.getElementById("llmOptToggle");
   if (configured && state.azureConnected) {
     indicator.className = "status-indicator on"; indicator.title = "Configured";
     badge.classList.remove("hidden");
     if (toggle) toggle.checked = true;
     if (llmOptContainer) llmOptContainer.classList.remove("hidden");
+    // AI Optimization defaults to OFF — user opts in explicitly because it adds latency.
+    if (llmOptToggle) llmOptToggle.checked = false;
   } else {
     indicator.className = "status-indicator off"; indicator.title = "Not configured";
     badge.classList.add("hidden");
     if (toggle) toggle.checked = false;
     if (llmOptContainer) llmOptContainer.classList.add("hidden");
+    if (llmOptToggle) llmOptToggle.checked = false;
   }
 }
 
@@ -382,7 +401,20 @@ async function uploadFile(file) {
   try {
     const res = await fetch("/api/upload", { method: "POST", body: form });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    if (!res.ok) {
+      if (data.errorCode === "LLM_REQUIRED") {
+        uploadProgress.classList.add("hidden");
+        uploadError.classList.remove("hidden");
+        uploadError.innerHTML = `<strong>\u{1F916} AI model required.</strong> ${data.message || data.error}` +
+          (data.weakTargets && data.weakTargets.length ? `<br><small>Unmapped: ${data.weakTargets.join(", ")}</small>` : "") +
+          `<br><a href="#" id="openSettingsLink">Open Settings to configure the AI model</a>`;
+        const link = document.getElementById("openSettingsLink");
+        if (link) link.addEventListener("click", (e) => { e.preventDefault(); const btn = document.getElementById("settingsBtn"); if (btn) btn.click(); });
+        fileInput.value = "";
+        return;
+      }
+      throw new Error(data.error);
+    }
     fill.style.width = "100%"; fill.textContent = "Done!";
     state.sessionId = data.sessionId;
     state.stepsCompleted[1] = true;
@@ -399,26 +431,85 @@ async function uploadFile(file) {
 function populateResults(data) {
   state.lastSourceColumns = data.sourceColumns || [];
   state.lastUploadData = data; // store for after accept
+  state.activeSpec = data.activeSpec || null;
 
   // Render column mapping table (PRIMARY focus)
-  const tbody = document.querySelector("#columnMappingTable tbody");
-  tbody.innerHTML = "";
-  if (data.mappingInfo && data.mappingInfo.length > 0) {
-    data.mappingInfo.forEach(m => {
-      const tr = document.createElement("tr");
-      const isMapped = m.type === "direct" || m.type === "computed";
-      const sourceText = m.source || "—";
-      const reason = m.reason || (isMapped ? "Mapped" : "No mapping");
-      const rowClass = isMapped ? "mapping-row-ok" : "mapping-row-miss";
-      tr.className = rowClass;
-      tr.innerHTML = `<td>${esc(sourceText)}</td><td>${esc(m.target)}</td><td>${esc(reason)}</td>`;
-      tbody.appendChild(tr);
-    });
+  renderMappingTable(data.mappingInfo || []);
+
+  // Sheet summary line (multi-tab inventories like CAH PROD+DR).
+  const sheetSummaryEl = document.getElementById("sheetSummary");
+  if (sheetSummaryEl) {
+    const parts = [];
+    if (Array.isArray(data.sheetSummary) && data.sheetSummary.length > 0) {
+      parts.push(`Detected sheets: ${data.sheetSummary.map(s => `${s.sheet} (${s.rowCount})`).join(", ")}`);
+    }
+    parts.push(`Mapping source: ${data.mappingSource || "auto"}`);
+    sheetSummaryEl.textContent = parts.join("\u00a0\u00a0\u2022\u00a0\u00a0");
+    sheetSummaryEl.classList.remove("hidden");
   }
+
+  // AI status banner — explicit, prominent, replaces inline aiNotice text.
+  renderAiStatus(data);
+
+  // Inventory quality warning banner.
+  showInventoryQualityIssue(data.inventoryQualityIssue);
 
   // Hide conversion results until user accepts
   document.getElementById("conversionResults").classList.add("hidden");
   document.getElementById("proceedToProject").classList.add("hidden");
+}
+
+function renderMappingTable(mappingInfo) {
+  const tbody = document.querySelector("#columnMappingTable tbody");
+  tbody.innerHTML = "";
+  for (const m of mappingInfo) {
+    const tr = document.createElement("tr");
+    const isMapped = m.type === "direct" || m.type === "computed";
+    const sourceText = m.source || "\u2014";
+    const reason = m.reason || (isMapped ? "Mapped" : "No mapping");
+    tr.className = isMapped ? "mapping-row-ok" : "mapping-row-miss";
+    tr.innerHTML = `<td>${esc(sourceText)}</td><td>${esc(m.target)}</td><td>${esc(reason)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function showInventoryQualityIssue(issue) {
+  const el = document.getElementById("inventoryQualityWarn");
+  if (!el) return;
+  if (!issue) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  const list = (issue.details || []).map(d => `<li><code>${esc(d.target)}</code> filled in only ${(d.filledRatio * 100).toFixed(0)}% of rows</li>`).join("");
+  el.innerHTML = `<strong>\u26a0\ufe0f Inventory quality issue.</strong> ${esc(issue.message)}${list ? `<ul>${list}</ul>` : ""}`;
+  el.classList.remove("hidden");
+}
+
+// Renders the AI verification status banner above the mapping table. Tells the user
+// at a glance whether (a) rules covered everything, or (b) the AI was triggered to
+// refine weak mappings, and which targets it touched.
+function renderAiStatus(data) {
+  const el = document.getElementById("aiStatusBanner");
+  if (!el) return;
+  const status = data.aiStatus || "not-needed";
+  const notice = data.aiNotice || {};
+  let cls = "alert alert-info";
+  let html = "";
+  if (status === "not-needed") {
+    cls = "alert alert-success";
+    html = `<strong>\u2705 Rule-based mapping complete.</strong> All required columns were mapped from the source inventory. AI was not needed.`;
+  } else if (status === "triggered-applied") {
+    cls = "alert alert-primary";
+    const targets = (notice.targets || []).map(t => `<code>${esc(t)}</code>`).join(", ");
+    const weak = (notice.originalWeakTargets || []).map(t => `<code>${esc(t)}</code>`).join(", ");
+    html = `<strong>\u{1F916} AI verification triggered.</strong> Rule-based mapping had weak coverage for ${weak}. AI refined ${notice.targets.length} target(s): ${targets}.`;
+  } else if (status === "triggered-no-change") {
+    cls = "alert alert-info";
+    html = `<strong>\u{1F916} AI verification triggered.</strong> ${esc(notice.reason || "AI confirmed rule-based mapping.")}`;
+  } else if (status === "triggered-failed") {
+    cls = "alert alert-warning";
+    html = `<strong>\u26a0\ufe0f AI verification failed.</strong> ${esc(notice.reason || "Unknown error")}. Falling back to rule-based mapping \u2014 review carefully.`;
+  }
+  el.className = cls;
+  el.innerHTML = html;
+  el.classList.remove("hidden");
 }
 
 // Accept Mapping button — show conversion results and enable proceed
@@ -459,37 +550,83 @@ document.getElementById("downloadReport").addEventListener("click", () => window
 document.getElementById("reuploadBtn").addEventListener("click", () => { uploadProgress.classList.add("hidden"); fileInput.value = ""; goToStep(1); });
 document.getElementById("proceedToProject").addEventListener("click", () => { detectAndBuildEnvTabs(); goToStep(3); });
 
-// AI Fix Mapping button (in column mapping table)
+// AI Fix Mapping button (in column mapping table) — actually re-runs the conversion.
 document.getElementById("aiFixMappingBtn").addEventListener("click", async () => {
   const btn = document.getElementById("aiFixMappingBtn");
-  btn.disabled = true; btn.textContent = "AI is analyzing mapping...";
+  const originalLabel = "\u{1F916} Let AI Agent Handle Mapping";
+  btn.disabled = true; btn.textContent = "AI is analyzing & remapping...";
+
+  if (!state.sessionId) {
+    btn.disabled = false; btn.textContent = originalLabel;
+    alert("Please upload an inventory file first.");
+    return;
+  }
 
   try {
     const res = await fetch("/api/llm/suggest-mapping", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sourceColumns: state.lastSourceColumns || [] }),
+      body: JSON.stringify({ sessionId: state.sessionId }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    if (!res.ok) throw new Error(data.error || "AI mapping failed");
 
-    // Update the mapping table with AI suggestions
-    const tbody = document.querySelector("#columnMappingTable tbody");
-    const suggestion = data.suggestion || {};
-    tbody.innerHTML = "";
-    for (const [targetCol, val] of Object.entries(suggestion)) {
-      const tr = document.createElement("tr");
-      const sourceText = val === null ? "—" : (typeof val === "object" ? (val.formula || JSON.stringify(val)) : val);
-      const isMapped = val !== null;
-      const reason = val === null ? "No match found" : (typeof val === "object" ? "Computed (AI)" : "AI matched");
-      tr.className = isMapped ? "mapping-row-ok" : "mapping-row-miss";
-      tr.innerHTML = `<td>${esc(sourceText)}</td><td>${esc(targetCol)}</td><td>${esc(reason)}</td>`;
-      tbody.appendChild(tr);
+    // Refresh the mapping table with whatever the server returned (applied or preview).
+    renderMappingTable(data.mappingInfo || []);
+
+    if (data.applied === false) {
+      // AI ran but the result is too poor to apply automatically.
+      showInventoryQualityIssue(data.inventoryQualityIssue || {
+        message: "AI mapping did not produce a usable result.",
+        details: [],
+      });
+      btn.textContent = "\u26a0 AI could not produce a usable mapping";
+      btn.disabled = false;
+      return;
     }
-    btn.textContent = "\u2713 AI Mapping Applied";
+
+    // Update cached upload-shape data so the Accept Mapping button uses the AI results.
+    const merged = Object.assign({}, state.lastUploadData, {
+      mappingInfo: data.mappingInfo,
+      activeSpec: data.activeSpec,
+      validRows: data.validRows,
+      invalidRows: data.invalidRows,
+      totalRows: data.totalRows,
+      errors: data.errors,
+      report: data.report,
+      hasErrors: data.hasErrors,
+      mappingSource: data.mappingSource,
+      inventoryQualityIssue: null,
+    });
+    state.lastUploadData = merged;
+    state.activeSpec = data.activeSpec || null;
+    showInventoryQualityIssue(null);
+
+    // If the user has already pressed Accept, also refresh the visible counts so they
+    // see the AI improvement immediately.
+    const conv = document.getElementById("conversionResults");
+    if (conv && !conv.classList.contains("hidden")) {
+      document.getElementById("validCount").textContent = data.validRows;
+      document.getElementById("invalidCount").textContent = data.invalidRows;
+      document.getElementById("totalCount").textContent = data.totalRows;
+      const errSec = document.getElementById("errorsSection");
+      if (data.errors && data.errors.length > 0) {
+        errSec.classList.remove("hidden");
+        const ebody = document.querySelector("#errorsTable tbody");
+        ebody.innerHTML = "";
+        data.errors.forEach(e => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${esc(e.serverName)}</td><td>${esc(e.error)}</td>`;
+          ebody.appendChild(tr);
+        });
+      } else { errSec.classList.add("hidden"); }
+      document.getElementById("reportContent").textContent = data.report || "";
+    }
+
+    btn.textContent = `\u2713 AI Mapping Applied (${data.validRows}/${data.totalRows} valid)`;
   } catch (err) {
     alert(`AI error: ${err.message}`);
-    btn.textContent = "\u{1F916} Let AI Agent Handle Mapping";
+    btn.textContent = originalLabel;
   }
   btn.disabled = false;
 });
@@ -597,6 +734,7 @@ function buildEnvTabs(environments, envCounts) {
       cpuArchitecture: "amd",
       storageTier: "auto",
       securityEnabled: true,
+      sizingMode: document.getElementById("globalSizingMode")?.value || "auto",
     };
     state.envNeedsRerun[env] = true;
     state.envComplete[env] = false;
@@ -623,6 +761,28 @@ function buildEnvTabs(environments, envCounts) {
     const seriesCbs = document.querySelectorAll(`#series-${envId} input[type=checkbox]`);
     seriesCbs.forEach(cb => cb.addEventListener("change", () => { updateEnvConfig(env); markNeedsRerun(env); }));
   });
+
+  // Wire the global Sizing Mode override (single dropdown, applies to ALL envs).
+  // Changing sizing mode requires a re-run because cores/memory targets change.
+  const globalSizing = document.getElementById("globalSizingMode");
+  if (globalSizing && globalSizing.dataset.bound !== "1") {
+    globalSizing.dataset.bound = "1";
+    globalSizing.addEventListener("change", () => {
+      const mode = globalSizing.value || "auto";
+      const helpText = document.getElementById("sizingModeHelpText");
+      if (helpText) {
+        helpText.textContent = mode === "auto"
+          ? "Auto picks the safest method per server based on telemetry availability."
+          : mode === "as-allocated"
+          ? "Sizing will match allocated CPU/Memory for every server."
+          : "Performance-based applied where utilization data exists; rows without data fall back safely.";
+      }
+      environments.forEach(e => {
+        updateEnvConfig(e);
+        markNeedsRerun(e);
+      });
+    });
+  }
 }
 
 function buildEnvConfigHtml(env, envId) {
@@ -708,6 +868,7 @@ function updateEnvConfig(env) {
     cpuArchitecture: document.getElementById(`arch-${envId}`)?.value || "amd",
     storageTier: document.getElementById(`storage-${envId}`)?.value || "auto",
     securityEnabled: document.getElementById(`security-${envId}`)?.checked !== false,
+    sizingMode: document.getElementById("globalSizingMode")?.value || "auto",
   };
 }
 
@@ -763,6 +924,8 @@ function updateCombinedTotal(combined) {
   document.getElementById("combinedTotalBar").classList.remove("hidden");
   // Show env pricing summary below combined bar
   renderEnvPricingSummary("envPricingSummary3");
+  // Sizing summary banner (Step 3) — visible alongside the combined total bar.
+  renderSizingSummaryBanner(combined.sizingSummary, "sizingSummaryBannerStep3");
 }
 
 function renderEnvPricingSummary(containerId) {
@@ -862,7 +1025,7 @@ document.getElementById("runAssessmentBtn").addEventListener("click", async () =
     const response = await fetch("/api/assessment/run-multi", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Token-Id": state.tokenId },
-      body: JSON.stringify({ sessionId: state.sessionId, subscriptionId: subId, region, assessmentName, customerName: state.customerName, envConfigs: envsToRun, skipLlm: !document.getElementById("llmOptToggle").checked }),
+      body: JSON.stringify({ sessionId: state.sessionId, subscriptionId: subId, region, assessmentName, customerName: state.customerName, envConfigs: envsToRun, skipLlm: !state.llmConfigured || !document.getElementById("llmOptToggle").checked }),
     });
 
     const reader = response.body.getReader();
@@ -942,11 +1105,100 @@ document.getElementById("proceedToResults").addEventListener("click", () => { re
 
 // ============ STEP 4: ASSESSMENT RESULTS ============
 
+// Renders the sizing-summary banner (Bootstrap alert) into the given container.
+// `summary` shape comes from assessment.js buildSizingSummary / server.js combined.
+//
+// IMPORTANT: the three primary buckets (asAllocated / performanceBased /
+// performanceBasedPartial) are mutually exclusive and sum to totalServers.
+// `flooredCount`, `cappedCount`, and `*FallbackCount` are SUB-FLAGS that overlap
+// with those buckets, so they're shown INLINE under the bucket they belong to
+// (telemetry gaps under As-Allocated; floored/capped under Performance-Based)
+// to avoid any "does this add up?" confusion.
+function renderSizingSummaryBanner(summary, containerId) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!summary || !summary.totalServers) { el.innerHTML = ""; return; }
+
+  const {
+    modeRequested, totalServers,
+    asAllocated = 0, performanceBased = 0, performanceBasedPartial = 0,
+    flooredCount = 0, cappedCount = 0,
+    zeroFallbackCount = 0, missingFallbackCount = 0,
+  } = summary;
+
+  const fallbackTotal = zeroFallbackCount + missingFallbackCount;
+  const perfTotal = performanceBased + performanceBasedPartial;
+  const requestedPerf = modeRequested === "performance-based";
+  const heavyFallback = requestedPerf && totalServers > 0 && (asAllocated / totalServers) > 0.5;
+  const alertClass = heavyFallback ? "alert alert-warning" : "alert alert-info";
+
+  const modeLabel = {
+    "auto": "Auto (Recommended)",
+    "as-allocated": "As-Allocated",
+    "performance-based": "Performance-Based",
+    "mixed": "Mixed (per environment)",
+  }[modeRequested] || modeRequested || "Auto";
+
+  // Build "rows" — one per primary bucket, with sub-flags shown inline so the
+  // relationship is obvious (e.g. "119 Performance-Based — 97 hit the 20% floor").
+  const rows = [];
+
+  if (asAllocated) {
+    const subBits = [];
+    if (fallbackTotal) subBits.push(`${fallbackTotal} fell back due to missing telemetry`);
+    rows.push(`
+      <div class="d-flex align-items-baseline gap-2">
+        <span class="badge bg-secondary" style="min-width:5em;">${asAllocated}</span>
+        <strong>As-Allocated</strong>
+        ${subBits.length ? `<span class="text-muted small">&mdash; ${subBits.join("; ")}</span>` : ""}
+      </div>
+    `);
+  }
+
+  if (performanceBased || performanceBasedPartial) {
+    const subBits = [];
+    if (flooredCount) subBits.push(`${flooredCount} hit the 20% utilization floor (safe minimum)`);
+    if (cappedCount) subBits.push(`${cappedCount} hit the 100% utilization cap`);
+    if (performanceBasedPartial) subBits.push(`${performanceBasedPartial} used partial telemetry (one metric only)`);
+    rows.push(`
+      <div class="d-flex align-items-baseline gap-2">
+        <span class="badge bg-primary" style="min-width:5em;">${perfTotal}</span>
+        <strong>Performance-Based</strong>
+        ${subBits.length ? `<span class="text-muted small">&mdash; ${subBits.join("; ")}</span>` : ""}
+      </div>
+    `);
+  }
+
+  let warnMsg = "";
+  if (heavyFallback) {
+    warnMsg = `<div class="small mt-2"><i class="bi bi-exclamation-triangle"></i> <strong>Heads up:</strong> You requested Performance-Based, but ${asAllocated} of ${totalServers} servers had no usable utilization data and were sized as-allocated for safety.</div>`;
+  }
+
+  el.innerHTML = `
+    <div class="${alertClass} mb-0 py-2 px-3" role="alert">
+      <div class="d-flex flex-wrap align-items-center gap-2 mb-1">
+        <i class="bi bi-rulers fs-5"></i>
+        <strong class="me-1">Sizing Mode:</strong>
+        <span class="me-2">${modeLabel}</span>
+        <span class="vr"></span>
+        <span class="text-muted small">${totalServers} server${totalServers === 1 ? "" : "s"} sized</span>
+      </div>
+      <div class="d-flex flex-column gap-1 ps-1">
+        ${rows.join("")}
+      </div>
+      ${warnMsg}
+    </div>
+  `;
+}
+
 function renderAssessmentReport(report) {
   if (!report) return;
 
   // Show env pricing config summary at top of Step 4
   renderEnvPricingSummary("envPricingSummary4");
+
+  // Sizing summary banner (Step 4)
+  renderSizingSummaryBanner(report.sizingSummary, "sizingSummaryBanner");
 
   // Summary cards
   const cards = document.getElementById("assessSummaryCards");
@@ -1616,6 +1868,52 @@ document.getElementById("backToStep6").addEventListener("click", () => goToStep(
 
 let wavePlanData = null;
 let wavePlanGroupingModes = [];
+let lastUserInstructions = "";
+
+// Determine which tag keys the user actually referenced in their instructions.
+// Returns a Set of lowercase keys, or null if no instructions / nothing matched
+// (caller should then show all tags as before).
+function relevantTagKeysFromInstructions(instructions, plan) {
+  const text = (instructions || "").toString().toLowerCase().trim();
+  if (!text || !plan || !plan.waves) return null;
+  // Aggregate every tag key + its values across all groups
+  const allTags = {}; // key -> Set(values)
+  for (const w of plan.waves) {
+    for (const g of w.groups || []) {
+      if (!g.tags) continue;
+      for (const [k, v] of Object.entries(g.tags)) {
+        if (!v) continue;
+        const key = k.toLowerCase();
+        if (!allTags[key]) allTags[key] = new Set();
+        for (const part of String(v).split(/\s*,\s*/)) {
+          if (part) allTags[key].add(part.toLowerCase());
+        }
+      }
+    }
+  }
+  const matched = new Set();
+  for (const [key, vals] of Object.entries(allTags)) {
+    // (1) Match by key tokens (>=3 chars), e.g. "environment" or "tier" appearing in the text
+    const keyTokens = key.split(/\W+/).filter(t => t && t.length >= 3);
+    let hit = keyTokens.some(t => text.includes(t));
+    // (2) Match by any of the key's values appearing in the text. Combine key+value
+    //     forms as well (e.g. "tier1", "prod") for short numeric values.
+    if (!hit) {
+      for (const val of vals) {
+        if (!val) continue;
+        if (val.length >= 3 && new RegExp(`\\b${val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text)) { hit = true; break; }
+        // key+value concatenated, e.g. "tier1", "tier 1"
+        for (const kt of keyTokens) {
+          const re = new RegExp(`\\b${kt}[\\s\\-_]*${val.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z0-9])`, "i");
+          if (re.test(text)) { hit = true; break; }
+        }
+        if (hit) break;
+      }
+    }
+    if (hit) matched.add(key);
+  }
+  return matched.size > 0 ? matched : null;
+}
 
 // Initialize Wave Plan when entering Step 7
 function initWavePlan() {
@@ -1745,6 +2043,7 @@ document.getElementById("wpGenerateBtn").addEventListener("click", async () => {
   const sel = document.getElementById("wpGroupBy");
   const selectedMode = wavePlanGroupingModes.find(m => m.id === sel.value);
   const userInstructions = document.getElementById("wpUserInstructions").value.trim();
+  lastUserInstructions = userInstructions;
   const useAI = state.llmConfigured && userInstructions.length > 0;
 
   wpShowStatus(useAI ? "Generating wave plan with AI assistance..." : "Generating wave plan (rule-based)...", "loading");
@@ -1814,6 +2113,10 @@ function renderWavePlan(plan) {
   const tbody = document.getElementById("wpTimelineBody");
   tbody.innerHTML = "";
 
+  // If the user gave instructions, restrict the AI Insight column to only the tag
+  // keys they referenced (e.g. instruction "Tier 1 to last wave" => only `system tier`).
+  const relevantKeys = relevantTagKeysFromInstructions(lastUserInstructions, plan);
+
   for (const wave of plan.waves) {
     const scopeText = wave.groups.map(g => g.name).join(", ");
     // Collect unique tag values across groups in this wave for quick visual confirmation
@@ -1821,7 +2124,10 @@ function renderWavePlan(plan) {
     for (const g of wave.groups) {
       if (g.tags) {
         for (const [k, v] of Object.entries(g.tags)) {
-          if (v) { if (!waveTags[k]) waveTags[k] = new Set(); waveTags[k].add(v); }
+          if (!v) continue;
+          if (relevantKeys && !relevantKeys.has(k.toLowerCase())) continue;
+          if (!waveTags[k]) waveTags[k] = new Set();
+          waveTags[k].add(v);
         }
       }
     }
@@ -1890,6 +2196,7 @@ function renderGantt(plan) {
 function renderWaveDetails(plan) {
   const container = document.getElementById("wpWaveDetails");
   container.innerHTML = "";
+  const relevantKeys = relevantTagKeysFromInstructions(lastUserInstructions, plan);
 
   for (const wave of plan.waves) {
     const id = `wpWave${wave.waveNumber}`;
@@ -1899,7 +2206,7 @@ function renderWaveDetails(plan) {
       let tagsHtml = "";
       if (g.tags && Object.keys(g.tags).length) {
         tagsHtml = Object.entries(g.tags)
-          .filter(([, v]) => v)
+          .filter(([k, v]) => v && (!relevantKeys || relevantKeys.has(k.toLowerCase())))
           .map(([k, v]) => `<span class="badge bg-info text-dark ms-1">${escHtml(k)}: ${escHtml(v)}</span>`)
           .join("");
       }
@@ -2189,3 +2496,20 @@ document.getElementById("historySessionsList").addEventListener("click", async (
 // Auto-load history on page load to show badge count
 loadHistorySessions();
 
+//Pay as you to by hours
+//Load Wave Plan config by customer input
+//exclude certain env from TCO or Better DR planning with identifying 
+//Future Scope INtegrate in copilot
+//Assessment for VMWare migration, SAP MIgration, Citrix Machine, Desktop as a service
+//Modernizaton Scenarios and app classification Rehost, Refactor, Rearchitect, Rebuild, Replace
+//Generate wave plan always use AI with or without user instruction because it is llm optimization
+//and one call only
+
+//Immediate next steps:
+
+//in the wave plan timeline show Date time and not just bars
+// which appplication has been DR, so decide to do exclude certain app
+//perhaps by rto rpo and do asr on that instead so this is more comprehensive
+// Same goes for Bacup strategy
+//deploy to sandbox with no history loadm and about and download label in sidebar
+ 

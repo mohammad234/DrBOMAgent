@@ -240,11 +240,13 @@ async function call(systemPrompt, userContent, options = {}) {
  * TASK: Suggest column mapping for unknown source columns.
  * Uses prompts from prompts.json for maintainability.
  */
-async function suggestColumnMapping(sourceColumns, targetColumns) {
+async function suggestColumnMapping(sourceColumns, targetColumns, sampleRows, baselineSpec) {
   const prompts = loadPrompts();
   const systemPrompt = prompts.columnMapping.system;
   const userContent = prompts.columnMapping.user
     .replace("{{sourceColumns}}", JSON.stringify(sourceColumns))
+    .replace("{{sampleRows}}", JSON.stringify(sampleRows || [], null, 2))
+    .replace("{{baselineSpec}}", JSON.stringify(baselineSpec || {}, null, 2))
     .replace("{{targetColumns}}", JSON.stringify(targetColumns));
 
   return await call(systemPrompt, userContent, { json: true });

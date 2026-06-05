@@ -160,16 +160,31 @@ Inventory CSV/XLSX
 - Preserves unmapped columns as `extraColumns` for later use in grouping
 
 ### 6.2 VM Sizing (`assessment.js` + `SKUSizingLogic.json`)
-- **Mode:** "as-allocated" (use vCPU/RAM as reported) or "performance-based" (with percentile+comfort factor)
+- **Modes:**
+  - `as-allocated` — use the vCPU/RAM as reported in the inventory
+  - `performance-based` — use observed CPU/Memory utilization (95th percentile preferred) multiplied by a comfort factor (default 1.3) to derive `reqCores` / `reqMemMB`
+  - `auto` (default) — picks per row: performance-based when utilization columns are present and usable, otherwise falls back to as-allocated
+- **Safety edge cases** (in `computeRequiredResources`):
+  - Floor: utilization below `minimumUtilizationPercent` (20%) is clamped to 20% (recorded as `floored`)
+  - Cap: utilization above `maximumUtilizationPercent` (100%) is clamped (recorded as `capped`)
+  - `treatZeroAs` / `treatMissingAs` — default `"as-allocated"`: rows with 0% utilization or missing telemetry safely fall back
+  - Returns a `sizing` object with `sizingMode`, `sizingReason`, `cpuUtilUsed`, `memUtilUsed`, `reqCores`, `reqMemMB`
+- **Global override:** UI sends a `sizingMode` value that threads through the pipeline as `sizingModeOverride` — it takes precedence over `SKUSizingLogic.json → rightSizing.mode` **without mutating shared config** (safe for concurrent requests). Plumbed through:
+  - `computeRequiredResources(server, cores, memMB, modeOverride)`
+  - `firstPassVmMatch(server, vmSizes, series, arch, sizedOverride)`
+  - `runFirstPassMatching(..., sizingModeOverride)`
+  - `rematchVmWithPricing(..., sizingModeOverride)`
+  - `generateAssessmentReport(..., { sizingModeOverride })`
 - **SKU Catalog:** Fetched from Azure Retail Prices API (no subscription needed)
 - **Matching Logic:**
   1. Filter SKUs by enabled VM series (D, E, F, L, M by default)
-  2. Filter where SKU.vCPUs >= required AND SKU.memoryGB >= required
-  3. Sort by cost (cheapest first), pick best fit
+  2. Filter where SKU.vCPUs >= `reqCores` AND SKU.memoryGB >= `reqMemMB`
+  3. Sort by family preference, then by waste (smallest fit)
 - **Disk Sizing:** Map source disk GB to Azure Managed Disk tier (Standard SSD default)
 - **Pricing Models:** PAYG, 1-Year RI, 3-Year RI (configurable)
 - **AHUB:** Azure Hybrid Benefit toggle (excludes Windows license cost)
 - **Caching:** In-memory with 1hr TTL for SKU/pricing data
+- **Sizing transparency:** `generateAssessmentReport` emits `report.sizingSummary` (counts: `asAllocated`, `performanceBased`, `performanceBasedPartial`, `flooredCount`, `cappedCount`, `zeroFallbackCount`, `missingFallbackCount`, `modeRequested`, `totalServers`). The primary buckets sum to `totalServers`; floor/cap/fallback counts overlap with them and are surfaced as sub-flag notes in the UI banner.
 
 ### 6.3 BOM Generation
 - Per-server: Compute + Storage + Security (Defender P2)
@@ -266,10 +281,10 @@ totalCapacity = maxPilotVMs + (numWaves × maxWaveVMs)
 | GET | `/api/azure/vm-sizes` | Fetch VM SKU catalog for region |
 | GET | `/api/assessment/prefetch-pricing` | Pre-cache pricing data |
 | GET | `/api/assessment/prefetch-region` | Pre-cache SKUs for new region |
-| POST | `/api/assessment/run` | Run sizing assessment (single env) |
-| POST | `/api/assessment/run-multi` | Run multi-environment assessment |
+| POST | `/api/assessment/run` | Run sizing assessment (single env). Accepts optional `sizingMode`. |
+| POST | `/api/assessment/run-multi` | Run multi-environment assessment. Each entry in `envConfigs` may carry `sizingMode`; backend stores `envData.inputServers` + `envData.sizingMode`. |
 | POST | `/api/assessment/recalculate` | Re-run with changed params |
-| POST | `/api/assessment/recalculate-env` | Re-run single environment |
+| POST | `/api/assessment/recalculate-env` | Re-run single environment. If `sizingMode` differs from stored, re-runs first-pass on cached `inputServers` (SKU can change); otherwise just refreshes pricing. |
 | GET | `/api/assessment/report` | Get latest assessment report |
 | POST | `/api/upload-assessment` | Upload Azure Migrate report XLSX |
 
@@ -351,8 +366,23 @@ const state = {
   lastUploadData: null,
   stepsCompleted: { 1-7: false },
   assessmentReport: null,  // populated after assessment
+  environments: [],        // env names detected from inventory
+  envConfigs: {},          // per-env: { pricingModel, useAhub, enabledSeries,
+                           //   cpuArchitecture, storageTier, securityEnabled, sizingMode }
+  envNeedsRerun: {},       // env -> bool, set when config changes
+  envComplete: {},         // env -> bool, set after first run
 };
 ```
+
+### Sizing Mode UI (global override)
+- A single dropdown `#globalSizingMode` in Step 3 above the env tabs (values: `auto`, `as-allocated`, `performance-based`)
+- `updateEnvConfig(env)` reads its value and writes the SAME value into every `state.envConfigs[env].sizingMode`
+- Changing the dropdown triggers `markNeedsRerun(env)` for every env (mode change can shift target vCPU/RAM and therefore the SKU)
+- `renderSizingSummaryBanner(summary, containerId)` renders a Bootstrap alert with mutually-exclusive primary buckets on the top row and overlapping sub-flag counts (floored / capped / telemetry-gap) as notes on a second row. Rendered in both Step 3 (`#sizingSummaryBannerStep3`) and Step 4 (`#sizingSummaryBanner`)
+
+### AI Optimization toggle
+- On page init, `/api/llm/status` is polled. If backend reports `configured: true`, `#llmOptToggleContainer` is shown but `#llmOptToggle.checked = false` (off by default — user opts in explicitly)
+- The multi-env run sends `skipLlm: !state.llmConfigured || !checked` so the backend never runs LLM optimization without an explicit opt-in
 
 ### Key Functions by Step
 

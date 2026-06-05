@@ -4,7 +4,7 @@
     <strong>Azure Migrate Assessment, TCO Analysis, BOM Builder & Wave Planner</strong>
   </p>
   <p align="center">
-    A self-contained local web tool for end-to-end Azure migration planning — from raw server inventory to a fully costed Bill of Materials and migration wave schedule.
+    A self-contained agentic tool for end-to-end Azure migration planning — from raw server inventory to a fully costed Bill of Materials and migration wave schedule.
   </p>
   <p align="center">
     <a href="#-quick-start">Quick Start</a> •
@@ -57,7 +57,7 @@ npm start
 | Capability | Description |
 |------------|-------------|
 | **Inventory Conversion** | Upload any server inventory (CSV/XLSX) → auto-maps to Azure Migrate import format |
-| **Local Assessment Engine** | Right-size VMs using Azure Retail Prices API (no Azure subscription needed for pricing) |
+| **Local Assessment Engine** | Right-size VMs using Azure Retail Prices API (no Azure subscription needed for pricing). Supports **Auto / As-Allocated / Performance-Based** sizing modes with a global override. |
 | **Full BOM Generation** | Compute, Storage, Security, Firewall, ExpressRoute, Egress, Backup — per-server and total |
 | **Wave Plan Builder** | Throughput-based capacity planning with timeline, Gantt chart, and configurable grouping |
 | **AI-Assisted Planning** | Optional Azure AI Foundary integration for intelligent wave assignment |
@@ -100,22 +100,76 @@ Dr. BOM Agent is a **7-step wizard** that guides you through the full migration 
 
 ## 📋 Prerequisites
 
-| Requirement | When Needed | Install |
-|-------------|-------------|---------|
-| **Node.js** v18+ | Always | [nodejs.org](https://nodejs.org/) |
-| **Azure CLI** | Steps 3–4 only | [aka.ms/installazurecli](https://aka.ms/installazurecli) |
-| Modern browser | Always | Edge, Chrome, or Firefox |
-| Azure subscription | Steps 3–4 only | [azure.com/free](https://azure.com/free) |
+### Core (always required)
 
-### Azure Resource Providers (for Steps 3–4 only)
+| Requirement | Install |
+|-------------|---------|
+| **Node.js** v18+ | [nodejs.org](https://nodejs.org/) |
+| **Git** (first install only) | [git-scm.com](https://git-scm.com/) |
+| Modern browser | Edge, Chrome, or Firefox |
 
-If using Azure Migrate integration, ensure these are registered on your subscription:
+### For Azure Migrate integration (Steps 3–4 only)
 
+| Requirement | Install |
+|-------------|---------|
+| **Azure CLI** | [aka.ms/installazurecli](https://aka.ms/installazurecli) |
+| **Azure Subscription** | [azure.com/free](https://azure.com/free) |
+
+> **Skip these** if you only want to do local sizing + BOM + Wave Plan. The local assessment engine uses the public Azure Retail Prices API — no login, no subscription, no cost.
+
+### For Agentic Workflow (Optional AI features)
+
+The following are only required when you enable AI-assisted column mapping or AI-assisted wave assignment:
+
+| Requirement | Purpose |
+|-------------|---------|
+| **Azure Subscription** | Required to host AI Foundry |
+| **Azure AI Foundry Endpoint** | The Azure OpenAI / AI Foundry resource endpoint URL |
+| **Azure AI Foundry Model** | A deployed model (e.g., `gpt-4o`, `gpt-5`) — deployment name is what you'll paste in Settings |
+
+In the running app, configure these from the Settings panel → **AI Configuration** section. You can switch AI on/off any time with the **AI Mode** toggle, and even when AI is configured, the per-assessment **AI Optimization** switch is **OFF by default** (it adds latency — enable only when needed).
+
+---
+
+## 🚀 After First Install — Daily Usage
+
+Once you've cloned the repo and run `npm install` once, you **never need to repeat those steps** unless you want to pull updates.
+
+### Scenario 1 — Server is still running, you closed the browser
+
+Just open: **http://localhost:3000** in any browser. No commands needed.
+
+### Scenario 2 — Server was stopped (or you rebooted the machine)
+
+Open a terminal in the project folder and run:
+
+```bash
+cd "C:\path\to\DrBOMAgent"
+npm start
 ```
-Microsoft.Migrate
-Microsoft.OffAzure
-Microsoft.KeyVault
+
+or on Windows just **double-click `start.bat`**. The browser opens automatically.
+
+> No `git pull`, no `npm install`, no setup wizard — these are only needed the very first time or when pulling updates.
+
+### Scenario 3 — Pulling project updates (occasional)
+
+```bash
+cd "C:\path\to\DrBOMAgent"
+git pull
+npm install   # only if package.json changed
+npm start
 ```
+
+### Useful commands
+
+| Command | What it does |
+|---------|--------------|
+| `npm start` | Normal start — runs the interactive CLI setup wizard, then launches server + browser |
+| `npm run quick` | Skip the CLI setup wizard (use saved config) and go straight to server + browser |
+| `npm run setup` | First-time install: runs `npm install` then `npm start` |
+
+To **stop the server**: press `Ctrl + C` in the terminal where it's running.
 
 ---
 
@@ -333,4 +387,3 @@ This project is open source. See [LICENSE](LICENSE) for details.
 <p align="center">
   Built with ❤️ for the Azure migration community
 </p>
-# DrBOMAgent

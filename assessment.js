@@ -18,6 +18,96 @@ function reloadSizingConfig() {
   sizingConfig = JSON.parse(fs.readFileSync(SIZING_CONFIG_PATH, "utf-8"));
 }
 
+// ============ RIGHT-SIZING (industry-standard, Azure Migrate aligned) ============
+// Decides cores/RAM required to serve the workload, given:
+//   - allocated cores/RAM (always known)
+//   - observed CPU% / Memory% utilization (optional, may be missing or zero)
+// Mode "auto" picks per-row: performance-based when utilization is present + valid,
+// otherwise falls back to as-allocated. Edge-case handling matches Azure Migrate's
+// guidance and is fully driven by the SKUSizingLogic.json `performanceBased` block.
+function parseUtilization(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  // Accept "23", "23%", "0.23" (decimal fraction), " 80 %"
+  const m = s.match(/^([\d.]+)\s*%?$/);
+  if (!m) return null;
+  let v = parseFloat(m[1]);
+  if (isNaN(v)) return null;
+  if (v > 0 && v <= 1) v = v * 100; // decimal fraction -> percent
+  return v;
+}
+
+// `modeOverride` (optional): "as-allocated" | "performance-based" | "auto" — when
+// supplied, takes precedence over sizingConfig.rightSizing.mode. This is how the UI's
+// global "Sizing Mode" override flows in without mutating shared config.
+function computeRequiredResources(server, cores, memoryMB, modeOverride) {
+  const rs = sizingConfig.rightSizing || {};
+  const mode = modeOverride || rs.mode || "as-allocated";
+  const asAlloc = rs.asAllocated || { cpuComfortFactor: 1.0, ramComfortFactor: 1.0 };
+  const perf = rs.performanceBased || {};
+  const minPct = typeof perf.minimumUtilizationPercent === "number" ? perf.minimumUtilizationPercent : 20;
+  const maxPct = typeof perf.maximumUtilizationPercent === "number" ? perf.maximumUtilizationPercent : 100;
+  const cpuFactor = perf.cpuComfortFactor || 1.3;
+  const ramFactor = perf.ramComfortFactor || 1.3;
+
+  // Always-allocated path
+  if (mode === "as-allocated") {
+    return {
+      reqCores: Math.ceil(cores * asAlloc.cpuComfortFactor),
+      reqMemMB: Math.ceil(memoryMB * asAlloc.ramComfortFactor),
+      sizingMode: "as-allocated",
+      sizingReason: "Mode=as-allocated (no telemetry sizing).",
+      cpuUtilUsed: null,
+      memUtilUsed: null,
+    };
+  }
+
+  const cpuRaw = server["CPU utilization percentage"] ?? server["CPU utilization"];
+  const memRaw = server["Memory utilization percentage"] ?? server["Memory utilization"];
+  const cpuPct = parseUtilization(cpuRaw);
+  const memPct = parseUtilization(memRaw);
+
+  // Per-row decision: any field that is missing OR explicitly zero falls back to as-allocated
+  // for that field. Zero is treated as "untrusted measurement" because a server reporting 0%
+  // CPU is more often a broken agent / off VM than a genuinely useless workload, and undersizing
+  // a real workload to the minimum SKU is far more dangerous than over-provisioning by 20-30%.
+  function decideEffectivePct(rawPct, kind) {
+    if (rawPct === null) return { pct: null, reason: `${kind} utilization missing -> ${perf.treatMissingAs || "as-allocated"}` };
+    if (rawPct === 0) return { pct: null, reason: `${kind} utilization is 0% (likely measurement gap / VM off) -> ${perf.treatZeroAs || "as-allocated"}` };
+    if (rawPct > maxPct) return { pct: maxPct, reason: `${kind} utilization ${rawPct}% capped at ${maxPct}%` };
+    if (rawPct < minPct) return { pct: minPct, reason: `${kind} utilization ${rawPct}% floored to ${minPct}% (industry minimum)` };
+    return { pct: rawPct, reason: `${kind} utilization ${rawPct}% (within band)` };
+  }
+
+  const cpuDecision = decideEffectivePct(cpuPct, "CPU");
+  const memDecision = decideEffectivePct(memPct, "Memory");
+
+  const reqCores = cpuDecision.pct == null
+    ? Math.ceil(cores * asAlloc.cpuComfortFactor)
+    : Math.max(1, Math.ceil(cores * (cpuDecision.pct / 100) * cpuFactor));
+
+  const reqMemMB = memDecision.pct == null
+    ? Math.ceil(memoryMB * asAlloc.ramComfortFactor)
+    : Math.max(512, Math.ceil(memoryMB * (memDecision.pct / 100) * ramFactor));
+
+  // Mode label for visibility in the report
+  let sizingMode;
+  if (cpuDecision.pct == null && memDecision.pct == null) sizingMode = "as-allocated";
+  else if (cpuDecision.pct != null && memDecision.pct != null) sizingMode = "performance-based";
+  else sizingMode = "performance-based (partial)";
+
+  return {
+    reqCores,
+    reqMemMB,
+    sizingMode,
+    sizingReason: `${cpuDecision.reason}; ${memDecision.reason}`,
+    cpuUtilUsed: cpuDecision.pct,
+    memUtilUsed: memDecision.pct,
+  };
+}
+
+
 // ============ IN-MEMORY CACHE ============
 const cache = {
   vmSkus: {},       // { region: { data: [...], fetchedAt } }  — from Retail API
@@ -158,7 +248,10 @@ function filterByArchitecture(vmList, architecture) {
 }
 
 // ============ FIRST-PASS VM MATCHING (config-driven) ============
-function firstPassVmMatch(server, vmSizes, enabledSeries, cpuArchitecture) {
+// `sizedOverride` (optional): pre-computed result of computeRequiredResources. When
+// provided, this function uses it directly instead of recomputing. runFirstPassMatching
+// passes this so the global sizing-mode override is honored.
+function firstPassVmMatch(server, vmSizes, enabledSeries, cpuArchitecture, sizedOverride) {
   const minCores = sizingConfig.compute?.minimums?.vCPUs || 2;
   const minMemGB = sizingConfig.compute?.minimums?.memoryGB || 4;
   const cores = parseInt(server["*Cores"]) || minCores;
@@ -179,14 +272,10 @@ function firstPassVmMatch(server, vmSizes, enabledSeries, cpuArchitecture) {
     selectedFamilies = familyRules[familyRules.length - 1].families;
   }
 
-  // Apply comfort factor based on sizing mode
-  const rightSizing = sizingConfig.rightSizing;
-  let reqCores = cores;
-  let reqMemMB = memoryMB;
-  if (rightSizing.mode === "as-allocated") {
-    reqCores = Math.ceil(cores * rightSizing.asAllocated.cpuComfortFactor);
-    reqMemMB = Math.ceil(memoryMB * rightSizing.asAllocated.ramComfortFactor);
-  }
+  // Apply right-sizing (industry-standard, edge-case-safe). See computeRequiredResources.
+  const sized = sizedOverride || computeRequiredResources(server, cores, memoryMB);
+  const reqCores = sized.reqCores;
+  const reqMemMB = sized.reqMemMB;
 
   // Filter by enabled series (user UI selection takes priority)
   // Match series prefix followed by a digit to avoid "Standard_D" matching "Standard_DC"
@@ -245,7 +334,8 @@ function firstPassVmMatch(server, vmSizes, enabledSeries, cpuArchitecture) {
     return wasteA - wasteB;
   });
 
-  return candidates[0];
+  const winner = candidates[0];
+  return winner;
 }
 
 // ============ FIRST-PASS DISK MATCHING (config-driven) ============
@@ -268,14 +358,21 @@ function firstPassDiskMatch(diskSizeGB, diskTypeOverride) {
 }
 
 // ============ RUN FIRST-PASS MATCHING ============
-function runFirstPassMatching(servers, vmSizes, enabledSeries, cpuArchitecture, storageTier) {
+// `sizingModeOverride` (optional): "as-allocated" | "performance-based" | "auto" —
+// global override from the UI. When undefined, sizingConfig.rightSizing.mode is used.
+function runFirstPassMatching(servers, vmSizes, enabledSeries, cpuArchitecture, storageTier, sizingModeOverride) {
   const series = enabledSeries || (sizingConfig.vmSeriesPreference || [])
     .filter(s => s.defaultEnabled).map(s => s.id);
   const arch = cpuArchitecture || sizingConfig.cpuArchitecture?.default || "auto";
   const diskType = storageTier || sizingConfig.storage.diskType || "StandardSSD";
+  const minCores = sizingConfig.compute?.minimums?.vCPUs || 2;
+  const minMemGB = sizingConfig.compute?.minimums?.memoryGB || 4;
 
   return servers.map(server => {
-    const vmMatch = firstPassVmMatch(server, vmSizes, series, arch);
+    const cores = parseInt(server["*Cores"]) || minCores;
+    const memoryMB = parseInt(server["*Memory (In MB)"]) || (minMemGB * 1024);
+    const sized = computeRequiredResources(server, cores, memoryMB, sizingModeOverride);
+    const vmMatch = firstPassVmMatch(server, vmSizes, series, arch, sized);
 
     const diskMatches = [];
     for (let i = 1; i <= 10; i++) {
@@ -293,12 +390,13 @@ function runFirstPassMatching(servers, vmSizes, enabledSeries, cpuArchitecture, 
 
     return {
       serverName: server["*Server name"],
-      cores: parseInt(server["*Cores"]) || 0,
-      memoryMB: parseInt(server["*Memory (In MB)"]) || 0,
+      cores,
+      memoryMB,
       osName: server["*OS name"] || "",
       osVersion: server["OS version"] || "",
       vmMatch: vmMatch ? { name: vmMatch.name, cores: vmMatch.numberOfCores, memoryMB: vmMatch.memoryInMB } : null,
       diskMatches,
+      sizing: sized,
       _extraColumns: server._extraColumns || {},
     };
   });
@@ -597,7 +695,7 @@ async function fetchSecurityPricing(region) {
 }
 
 // ============ REMATCH: Find next best SKU with available pricing ============
-function rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, excludeSkus, cpuArchitecture) {
+function rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, excludeSkus, cpuArchitecture, sizingModeOverride) {
   const minCores = sizingConfig.compute?.minimums?.vCPUs || 2;
   const minMemGB = sizingConfig.compute?.minimums?.memoryGB || 4;
   const cores = server.cores || minCores;
@@ -617,13 +715,11 @@ function rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, exclude
     selectedFamilies = familyRules[familyRules.length - 1].families;
   }
 
-  const rightSizing = sizingConfig.rightSizing;
-  let reqCores = cores;
-  let reqMemMB = memoryMB;
-  if (rightSizing.mode === "as-allocated") {
-    reqCores = Math.ceil(cores * rightSizing.asAllocated.cpuComfortFactor);
-    reqMemMB = Math.ceil(memoryMB * rightSizing.asAllocated.ramComfortFactor);
-  }
+  // Reuse the per-row sizing decision from first-pass when available, so the rematched
+  // SKU honors the same global override (or telemetry decision) that picked the original.
+  const sized = server.sizing || computeRequiredResources(server, cores, memoryMB, sizingModeOverride);
+  const reqCores = sized.reqCores;
+  const reqMemMB = sized.reqMemMB;
 
   const series = enabledSeries || (sizingConfig.vmSeriesPreference || [])
     .filter(s => s.defaultEnabled).map(s => s.id);
@@ -663,7 +759,7 @@ function rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, exclude
 
 // ============ GENERATE REPORT (with security cost + rematch logic) ============
 function generateAssessmentReport(matchedServers, vmPricing, diskPricing, options) {
-  const { assessmentName, region, pricingModel, useAhub, vmSizes, enabledSeries, cpuArchitecture, securityEnabled: secOverride, securityPerServerPrice } = options;
+  const { assessmentName, region, pricingModel, useAhub, vmSizes, enabledSeries, cpuArchitecture, securityEnabled: secOverride, securityPerServerPrice, sizingModeOverride } = options;
   const pricingModels = sizingConfig.pricingModels;
   const pricingDef = pricingModels.find(p => p.id === pricingModel) || pricingModels[2];
   const isRI = pricingModel !== "payg"; // 1yr or 3yr RI
@@ -708,7 +804,7 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
       let attempts = 0;
 
       while (!pricingResolved && attempts < MAX_REMATCH_ATTEMPTS) {
-        const nextBest = rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, excludeList, cpuArchitecture);
+        const nextBest = rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, excludeList, cpuArchitecture, sizingModeOverride);
         if (!nextBest) break;
 
         // Check if this SKU actually has pricing
@@ -790,6 +886,13 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
       suitability,
       isWindows,
       extraColumns: server._extraColumns || {},
+      // Right-sizing transparency: surface what the engine decided per server.
+      sizingMode: server.sizing?.sizingMode || "as-allocated",
+      sizingReason: server.sizing?.sizingReason || "",
+      cpuUtilUsed: server.sizing?.cpuUtilUsed ?? null,
+      memUtilUsed: server.sizing?.memUtilUsed ?? null,
+      reqCores: server.sizing?.reqCores ?? server.cores,
+      reqMemoryMB: server.sizing?.reqMemMB ?? server.memoryMB,
       note, // Last column: explains rematch or any special notes
     };
   });
@@ -803,6 +906,7 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
     useAhub,
     diskType: sizingConfig.storage.diskType,
     securityProduct: securityEnabled ? "Microsoft Defender for Cloud" : "None",
+    sizingSummary: buildSizingSummary(serverDetails, sizingModeOverride || sizingConfig.rightSizing?.mode || "as-allocated"),
     summary: {
       totalServers: matchedServers.length,
       suitable: suitableCount,
@@ -823,6 +927,37 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
 
 function round2(n) { return Math.round(n * 100) / 100; }
 
+// Aggregates per-server sizing decisions into a summary block for the UI banner.
+// `modeRequested` is what the user (or config) asked for. The actual breakdown counts
+// reflect what the per-row engine actually applied (e.g., a row with no telemetry will
+// show as as-allocated even if the user requested performance-based — this is the
+// correct, safe behavior, and the banner copy explains it).
+function buildSizingSummary(serverDetails, modeRequested) {
+  const summary = {
+    modeRequested,
+    totalServers: serverDetails.length,
+    asAllocated: 0,
+    performanceBased: 0,
+    performanceBasedPartial: 0,
+    flooredCount: 0,
+    cappedCount: 0,
+    zeroFallbackCount: 0,
+    missingFallbackCount: 0,
+  };
+  for (const s of serverDetails) {
+    const mode = s.sizingMode || "as-allocated";
+    if (mode === "as-allocated") summary.asAllocated++;
+    else if (mode === "performance-based") summary.performanceBased++;
+    else if (mode === "performance-based (partial)") summary.performanceBasedPartial++;
+    const reason = s.sizingReason || "";
+    if (/floored/.test(reason)) summary.flooredCount++;
+    if (/capped/.test(reason)) summary.cappedCount++;
+    if (/measurement gap/.test(reason)) summary.zeroFallbackCount++;
+    if (/missing/.test(reason)) summary.missingFallbackCount++;
+  }
+  return summary;
+}
+
 module.exports = {
   fetchVmSizesWithSub,
   runFirstPassMatching,
@@ -834,6 +969,7 @@ module.exports = {
   rematchVmWithPricing,
   filterByArchitecture,
   reloadSizingConfig,
+  computeRequiredResources,
   get sizingConfig() { return sizingConfig; },
   cache,
   round2,
