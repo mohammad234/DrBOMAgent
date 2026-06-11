@@ -1042,15 +1042,21 @@ function buildEnvTabs(environments, envCounts) {
     pane.innerHTML = buildEnvConfigHtml(env, envId);
     tabContent.appendChild(pane);
 
-    // Init default config for this env
+    // Init default config for this env. Cost mode auto-defaults to 'dr-defer'
+    // for any environment named 'DR' (case-insensitive variants) so the user is
+    // never silently double-counting DR-site servers as primary L&S compute.
     state.envConfigs[env] = {
       pricingModel: "3yr_ri",
       useAhub: true,
       enabledSeries: VM_SERIES_DEFAULT.filter(s => s.defaultEnabled).map(s => s.id),
       cpuArchitecture: "amd",
-      storageTier: "auto",
+      storageTier: detectDefaultStorageTier(env),
       securityEnabled: true,
       sizingMode: document.getElementById("globalSizingMode")?.value || "auto",
+      paygHoursPerMonth: 730,
+      costMode: detectDefaultCostMode(env),
+      cpuOptimisationFactor: parseFloat(document.getElementById("cpuOptFactor")?.value) || 0.70,
+      ramOptimisationFactor: parseFloat(document.getElementById("ramOptFactor")?.value) || 0.80,
     };
     state.envNeedsRerun[env] = true;
     state.envComplete[env] = false;
@@ -1065,17 +1071,68 @@ function buildEnvTabs(environments, envCounts) {
     const secCheck = document.getElementById(`security-${envId}`);
     const archSel = document.getElementById(`arch-${envId}`);
     const storageSel = document.getElementById(`storage-${envId}`);
+    const paygHoursInput = document.getElementById(`paygHours-${envId}`);
+    const paygHoursWrap = document.getElementById(`paygHoursWrap-${envId}`);
+    const paygHoursHelp = document.getElementById(`paygHoursHelp-${envId}`);
 
-    if (pricingSel) pricingSel.addEventListener("change", () => { updateEnvConfig(env); recalculateEnv(env); });
+    // Show/hide PAYG hours input based on pricing model
+    const togglePaygHoursVisibility = () => {
+      const isPayg = (pricingSel?.value === "payg");
+      if (paygHoursWrap) paygHoursWrap.classList.toggle("hidden", !isPayg);
+      if (paygHoursHelp) paygHoursHelp.classList.toggle("hidden", !isPayg);
+    };
+    togglePaygHoursVisibility();
+
+    if (pricingSel) pricingSel.addEventListener("change", () => {
+      togglePaygHoursVisibility();
+      updateEnvConfig(env);
+      recalculateEnv(env);
+    });
     if (ahubSel) ahubSel.addEventListener("change", () => { updateEnvConfig(env); recalculateEnv(env); });
     if (secCheck) secCheck.addEventListener("change", () => { updateEnvConfig(env); recalculateEnv(env); });
     // Arch/series/storage changes → mark needs re-run
     if (archSel) archSel.addEventListener("change", () => { updateEnvConfig(env); markNeedsRerun(env); });
     if (storageSel) storageSel.addEventListener("change", () => { updateEnvConfig(env); markNeedsRerun(env); });
 
+    // PAYG hours: live recalculate (debounced) on input, immediate on blur/Enter.
+    // On blur we also snap the visible value back into [1, 744] so users see the clamp.
+    if (paygHoursInput) {
+      let debTimer = null;
+      paygHoursInput.addEventListener("input", () => {
+        clearTimeout(debTimer);
+        debTimer = setTimeout(() => { updateEnvConfig(env); recalculateEnv(env); }, 350);
+      });
+      paygHoursInput.addEventListener("change", () => {
+        clearTimeout(debTimer);
+        let v = parseInt(paygHoursInput.value, 10);
+        if (!Number.isFinite(v) || v <= 0) v = 730;
+        if (v > 744) v = 744;
+        paygHoursInput.value = v;
+        updateEnvConfig(env);
+        recalculateEnv(env);
+      });
+    }
+
     // Series checkboxes
     const seriesCbs = document.querySelectorAll(`#series-${envId} input[type=checkbox]`);
     seriesCbs.forEach(cb => cb.addEventListener("change", () => { updateEnvConfig(env); markNeedsRerun(env); }));
+
+    // Cost-mode change. lns <-> dr-defer is an instant recalc (cost-only re-route);
+    // switching INTO 'exclude' (or out of it) requires a re-run because it bypasses
+    // the matching engine entirely.
+    const costModeSel = document.getElementById(`costMode-${envId}`);
+    if (costModeSel) {
+      costModeSel.addEventListener("change", () => {
+        const newMode = costModeSel.value;
+        const oldMode = state.envConfigs[env]?.costMode || "lns";
+        updateEnvConfig(env);
+        if (newMode === "exclude" || oldMode === "exclude") {
+          markNeedsRerun(env);
+        } else {
+          recalculateEnv(env);
+        }
+      });
+    }
   });
 
   // Wire the global Sizing Mode override (single dropdown, applies to ALL envs).
@@ -1083,19 +1140,35 @@ function buildEnvTabs(environments, envCounts) {
   const globalSizing = document.getElementById("globalSizingMode");
   if (globalSizing && globalSizing.dataset.bound !== "1") {
     globalSizing.dataset.bound = "1";
-    globalSizing.addEventListener("change", () => {
+    const ioInputs = document.getElementById("industryOptInputs");
+    // Show/hide factor inputs based on mode + update helper text
+    const syncSizingHelper = () => {
       const mode = globalSizing.value || "auto";
       const helpText = document.getElementById("sizingModeHelpText");
       if (helpText) {
-        helpText.textContent = mode === "auto"
-          ? "Auto picks the safest method per server based on telemetry availability."
-          : mode === "as-allocated"
-          ? "Sizing will match allocated CPU/Memory for every server."
-          : "Performance-based applied where utilization data exists; rows without data fall back safely.";
+        helpText.textContent =
+          mode === "auto" ? "Auto picks the safest method per server based on telemetry availability."
+          : mode === "as-allocated" ? "Sizing will match allocated CPU/Memory for every server."
+          : mode === "performance-based" ? "Performance-based applied where utilization data exists; rows without data fall back safely."
+          : "Industry-optimized: reduces over-allocated cores/RAM by the factors on the right. Use when no perf data is available (Gartner/Microsoft FastTrack guidance).";
       }
+      if (ioInputs) ioInputs.classList.toggle("hidden", mode !== "industry-optimized");
+    };
+    syncSizingHelper();
+    globalSizing.addEventListener("change", () => {
+      syncSizingHelper();
       environments.forEach(e => {
         updateEnvConfig(e);
         markNeedsRerun(e);
+      });
+    });
+    // Factor inputs: any change re-flows to all env configs + marks re-run.
+    ["cpuOptFactor", "ramOptFactor"].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el || el.dataset.bound === "1") return;
+      el.dataset.bound = "1";
+      el.addEventListener("change", () => {
+        environments.forEach(e => { updateEnvConfig(e); markNeedsRerun(e); });
       });
     });
   }
@@ -1108,11 +1181,35 @@ function buildEnvConfigHtml(env, envId) {
       <input type="checkbox" value="${s.id}" ${checked}> ${s.name}
     </label>`;
   }).join("");
+  const defaultMode = detectDefaultCostMode(env);
+  const drDeferSel = defaultMode === "dr-defer" ? "selected" : "";
+  const lnsSel = defaultMode === "lns" ? "selected" : "";
+  const exclSel = defaultMode === "exclude" ? "selected" : "";
+  const drBannerHtml = defaultMode === "dr-defer" ? `
+    <div id="envDrBanner-${envId}" class="alert alert-info py-2 px-3 small mb-2">
+      <i class="bi bi-shield-exclamation me-1"></i>
+      <strong>This environment looks like a DR site.</strong> It will still be SKU-sized, but its cost is
+      <strong>excluded from the Lift &amp; Shift total</strong> and surfaced in Step 5 (DR Strategy)
+      where the right Azure DR pattern (Active-Active, Hot ASR, Cold ASR, Backup-Restore) decides the final cost.
+    </div>` : "";
 
   return `
     <div id="envRerun-${envId}" class="alert alert-warning py-1 px-2 small mb-2 hidden"><i class="bi bi-exclamation-triangle"></i> Config changed — re-run assessment needed</div>
+    ${drBannerHtml}
     <div class="card bg-light">
       <div class="card-body p-3">
+        <div class="mb-3">
+          <label class="form-label small fw-semibold mb-1">Cost Treatment:</label>
+          <select class="form-select form-select-sm" id="costMode-${envId}" style="max-width:380px;">
+            <option value="lns" ${lnsSel}>Include in Lift &amp; Shift total (default)</option>
+            <option value="dr-defer" ${drDeferSel}>Size, but defer cost to DR Strategy (Step 5)</option>
+            <option value="exclude" ${exclSel}>Exclude from sizing entirely</option>
+          </select>
+          <div class="form-text" style="font-size:0.7rem; line-height:1.2;">
+            <strong>Defer:</strong> SKU-sizes the servers (used by active-active / Hot ASR strategies) but excludes them from the L&amp;S compute total.
+            <strong>Exclude:</strong> skips sizing entirely (use for decommissioned servers).
+          </div>
+        </div>
         <div class="mb-3">
           <label class="form-label small fw-semibold mb-1">VM Series:</label>
           <div id="series-${envId}" class="d-flex flex-wrap gap-2">${seriesHtml}</div>
@@ -1126,22 +1223,32 @@ function buildEnvConfigHtml(env, envId) {
           </select>
         </div>
         <div class="mb-3">
-          <label class="form-label small fw-semibold mb-1">Storage:</label>
-          <select class="form-select form-select-sm" id="storage-${envId}" style="max-width:280px;">
-            <option value="auto" selected>As per IOPS/Throughput (Default)</option>
-            <option value="PremiumSSD">Premium SSD (Override)</option>
-            <option value="StandardSSD">Standard SSD (Override)</option>
-            <option value="StandardHDD">Standard HDD (Override)</option>
+          <label class="form-label small fw-semibold mb-1">Storage Profile:</label>
+          <select class="form-select form-select-sm" id="storage-${envId}" style="max-width:380px;">
+            <option value="auto" selected>Auto — engine picks tier per disk (Standard SSD default)</option>
+            <option value="PremiumSSD">Production tier — Premium SSD (high IOPS)</option>
+            <option value="StandardSSD">Balanced tier — Standard SSD</option>
+            <option value="StandardHDD">Cost-optimised — Standard HDD (Dev/Test/cold)</option>
           </select>
+          <div class="form-text" style="font-size:0.7rem; line-height:1.2;">
+            Storage size is never shrunk (data-loss risk). The tier choice is where real cost savings live — Standard HDD is ~70% cheaper than Standard SSD for cold/non-prod workloads.
+          </div>
         </div>
         <div class="row g-3 mb-3">
           <div class="col-md-6">
             <label class="form-label small fw-semibold mb-1">Pricing Model:</label>
-            <select class="form-select form-select-sm" id="pricing-${envId}">
-              <option value="payg">Pay As You Go</option>
-              <option value="1yr_ri">1-Year Reserved Instance</option>
-              <option value="3yr_ri" selected>3-Year Reserved Instance</option>
-            </select>
+            <div class="d-flex gap-2 align-items-start">
+              <select class="form-select form-select-sm" id="pricing-${envId}" style="flex:1; min-width:0;">
+                <option value="payg">Pay As You Go</option>
+                <option value="1yr_ri">1-Year Reserved Instance</option>
+                <option value="3yr_ri" selected>3-Year Reserved Instance</option>
+              </select>
+              <div id="paygHoursWrap-${envId}" class="input-group input-group-sm hidden" style="width:140px; flex:0 0 140px;" title="Hours per month used for PAYG cost. Default 730 = monthly billing average. Maximum 744 = 31 × 24 hrs.">
+                <input type="number" class="form-control" id="paygHours-${envId}" value="730" min="1" max="744" step="1" aria-label="PAYG hours per month">
+                <span class="input-group-text" style="font-size:0.75rem;">hrs/mo</span>
+              </div>
+            </div>
+            <div id="paygHoursHelp-${envId}" class="form-text hidden" style="font-size:0.7rem; line-height:1.2;">PAYG runtime per month (1–744). Default 730 ≈ 24×7 billing avg. Lower values model VMs that auto-shut outside business hours.</div>
           </div>
           <div class="col-md-6">
             <label class="form-label small fw-semibold mb-1">License:</label>
@@ -1165,6 +1272,7 @@ function buildEnvConfigHtml(env, envId) {
       </div>
     </div>
     <div id="envSummary-${envId}" class="hidden mt-3">
+      <div id="envSummaryNote-${envId}" class="small text-info mb-1 hidden"></div>
       <div class="row g-2">
         <div class="col-4"><div class="summary-card-compute text-center p-2 rounded-3"><div class="fw-bold small" id="envCompute-${envId}">USD 0</div><div style="font-size:0.65em;opacity:0.8;">Compute</div></div></div>
         <div class="col-4"><div class="summary-card-storage text-center p-2 rounded-3"><div class="fw-bold small" id="envStorage-${envId}">USD 0</div><div style="font-size:0.65em;opacity:0.8;">Storage</div></div></div>
@@ -1177,6 +1285,19 @@ function buildEnvConfigHtml(env, envId) {
 function updateEnvConfig(env) {
   const envId = env.replace(/[^a-zA-Z0-9]/g, "_");
   const seriesCbs = document.querySelectorAll(`#series-${envId} input[type=checkbox]:checked`);
+  // Parse + clamp PAYG hours: [1, 744]. Empty/invalid → 730.
+  const hoursRaw = document.getElementById(`paygHours-${envId}`)?.value;
+  let paygHours = parseInt(hoursRaw, 10);
+  if (!Number.isFinite(paygHours) || paygHours <= 0) paygHours = 730;
+  if (paygHours > 744) paygHours = 744;
+  const costModeRaw = document.getElementById(`costMode-${envId}`)?.value;
+  const costMode = (costModeRaw === "dr-defer" || costModeRaw === "exclude") ? costModeRaw : "lns";
+  // Industry-optimisation factors come from global inputs. Clamped [0.30, 1.00];
+  // engine clamps again server-side as belt-and-braces.
+  const cpuOptRaw = parseFloat(document.getElementById("cpuOptFactor")?.value);
+  const ramOptRaw = parseFloat(document.getElementById("ramOptFactor")?.value);
+  const cpuOptF = Number.isFinite(cpuOptRaw) ? Math.min(1.0, Math.max(0.30, cpuOptRaw)) : 0.70;
+  const ramOptF = Number.isFinite(ramOptRaw) ? Math.min(1.0, Math.max(0.30, ramOptRaw)) : 0.80;
   state.envConfigs[env] = {
     pricingModel: document.getElementById(`pricing-${envId}`)?.value || "3yr_ri",
     useAhub: document.getElementById(`ahub-${envId}`)?.value === "ahub",
@@ -1185,7 +1306,30 @@ function updateEnvConfig(env) {
     storageTier: document.getElementById(`storage-${envId}`)?.value || "auto",
     securityEnabled: document.getElementById(`security-${envId}`)?.checked !== false,
     sizingMode: document.getElementById("globalSizingMode")?.value || "auto",
+    paygHoursPerMonth: paygHours,
+    costMode,
+    cpuOptimisationFactor: cpuOptF,
+    ramOptimisationFactor: ramOptF,
   };
+}
+
+// Default cost-mode based on env name. Pure heuristic: any env clearly named
+// 'DR' / 'Disaster Recovery' defaults to 'dr-defer'. Everything else to 'lns'.
+function detectDefaultCostMode(env) {
+  if (!env) return "lns";
+  const norm = String(env).trim().toLowerCase().replace(/[\s_\-./]/g, "");
+  if (norm === "dr" || norm === "disasterrecovery" || norm === "drsite") return "dr-defer";
+  return "lns";
+}
+
+// Default Storage Profile based on env name. Conservative defaults: non-prod
+// gets HDD (cheap, IO doesn't matter), everything else stays 'auto' so the
+// engine picks per-disk based on IOPS hints (falling back to Standard SSD).
+function detectDefaultStorageTier(env) {
+  if (!env) return "auto";
+  const norm = String(env).trim().toLowerCase().replace(/[\s_\-./]/g, "");
+  if (norm === "dev" || norm === "development" || norm === "test" || norm === "sit" || norm === "qa" || norm === "decom" || norm === "decommissioned") return "StandardHDD";
+  return "auto";
 }
 
 function markNeedsRerun(env) {
@@ -1225,23 +1369,150 @@ async function recalculateEnv(env) {
 function updateEnvSummary(env, report) {
   const envId = env.replace(/[^a-zA-Z0-9]/g, "_");
   const s = report.summary;
+  const ds = report.deferredSummary || { totalMonthlyCost: 0, totalServers: 0 };
+  const mode = report.costMode || state.envConfigs[env]?.costMode || "lns";
   document.getElementById(`envCompute-${envId}`).textContent = `USD ${fmtCost(s.totalMonthlyCompute)}`;
   document.getElementById(`envStorage-${envId}`).textContent = `USD ${fmtCost(s.totalMonthlyStorage)}`;
   document.getElementById(`envSecurity-${envId}`).textContent = `USD ${fmtCost(s.totalMonthlySecurity)}`;
   document.getElementById(`envSummary-${envId}`).classList.remove("hidden");
+  // Note line above the summary cards explains a non-default cost mode.
+  const noteEl = document.getElementById(`envSummaryNote-${envId}`);
+  if (noteEl) {
+    if (mode === "dr-defer" && ds.totalServers > 0) {
+      noteEl.classList.remove("hidden", "text-info", "text-warning");
+      noteEl.classList.add("text-info");
+      noteEl.innerHTML = `<i class="bi bi-shield-check"></i> <strong>${ds.totalServers} servers sized for DR.</strong> USD ${fmtCost(ds.totalMonthlyCost)}/mo deferred to Step 5 (DR Strategy) — not added to L&S total.`;
+    } else if (mode === "exclude") {
+      noteEl.classList.remove("hidden", "text-info", "text-warning");
+      noteEl.classList.add("text-warning");
+      noteEl.innerHTML = `<i class="bi bi-x-octagon"></i> <strong>Excluded from sizing</strong> — ${s.totalServers} servers in this environment are not part of the assessment.`;
+    } else {
+      noteEl.classList.add("hidden");
+      noteEl.innerHTML = "";
+    }
+  }
 }
 
 function updateCombinedTotal(combined) {
   const s = combined.summary;
+  const ds = combined.deferredSummary || { totalMonthlyCost: 0, totalServers: 0 };
+  const xs = combined.excludedSummary || { totalServers: 0 };
   document.getElementById("combinedCompute").textContent = `USD ${fmtCost(s.totalMonthlyCompute)}`;
   document.getElementById("combinedStorage").textContent = `USD ${fmtCost(s.totalMonthlyStorage)}`;
   document.getElementById("combinedSecurity").textContent = `USD ${fmtCost(s.totalMonthlySecurity)}`;
   document.getElementById("combinedTotal").textContent = `USD ${fmtCost(s.totalMonthlyCost)}`;
   document.getElementById("combinedTotalBar").classList.remove("hidden");
+  // Deferred / excluded annotation under the combined bar.
+  let annotationEl = document.getElementById("combinedDeferredNote");
+  if (!annotationEl) {
+    const bar = document.getElementById("combinedTotalBar");
+    if (bar && bar.parentNode) {
+      annotationEl = document.createElement("div");
+      annotationEl.id = "combinedDeferredNote";
+      annotationEl.className = "small text-muted mt-1";
+      bar.parentNode.insertBefore(annotationEl, bar.nextSibling);
+    }
+  }
+  if (annotationEl) {
+    const parts = [];
+    if (ds.totalServers > 0) {
+      parts.push(`<span class="text-info"><i class="bi bi-shield-check"></i> <strong>+ USD ${fmtCost(ds.totalMonthlyCost)}/mo</strong> deferred to DR Strategy (${ds.totalServers} servers sized)</span>`);
+    }
+    if (xs.totalServers > 0) {
+      parts.push(`<span class="text-warning"><i class="bi bi-x-octagon"></i> <strong>${xs.totalServers} servers excluded</strong></span>`);
+    }
+    annotationEl.innerHTML = parts.join(" &nbsp;·&nbsp; ");
+    annotationEl.style.display = parts.length ? "" : "none";
+  }
   // Show env pricing summary below combined bar
   renderEnvPricingSummary("envPricingSummary3");
   // Sizing summary banner (Step 3) — visible alongside the combined total bar.
   renderSizingSummaryBanner(combined.sizingSummary, "sizingSummaryBannerStep3");
+  // Inventory vs Azure optimisation footprint (cores, RAM, storage).
+  renderSizingOptimisationSummary(combined);
+}
+
+// Render the "Sizing Optimisation Summary" card: inventory cores/RAM vs Azure
+// recommended cores/RAM, with delta percentages. Counts L&S servers only so it
+// reflects the actual scope the customer is paying for. Excluded and deferred
+// servers are flagged in a footnote so the user can audit which servers were
+// dropped.
+function renderSizingOptimisationSummary(combined) {
+  const el = document.getElementById("sizingOptimisationSummary");
+  if (!el) return;
+  const s = combined.summary || {};
+  const opt = combined.optimisationSummary || {};
+  const invCores = opt.inventoryCores ?? s.inventoryCores ?? 0;
+  const invRamGB = Math.round((opt.inventoryRamMB ?? s.inventoryRamMB ?? 0) / 1024);
+  const recCores = opt.recommendedCores ?? s.recommendedCores ?? 0;
+  const recRamGB = Math.round((opt.recommendedRamMB ?? s.recommendedRamMB ?? 0) / 1024);
+  const cpuPct = opt.coresSavedPct ?? (invCores > 0 ? Math.round((1 - recCores / invCores) * 1000) / 10 : 0);
+  const ramPct = opt.ramSavedPct ?? (invRamGB > 0 ? Math.round((1 - recRamGB / invRamGB) * 1000) / 10 : 0);
+  const storageTB = ((opt.sourceDiskGB ?? s.sourceDiskGB ?? 0) / 1024).toFixed(1);
+  // If both totals are zero (no assessment yet) hide the card.
+  if (invCores === 0 && recCores === 0) {
+    el.classList.add("hidden");
+    return;
+  }
+  const ds = combined.deferredSummary || { totalServers: 0 };
+  const xs = combined.excludedSummary || { totalServers: 0 };
+  const scopeFootnote = (ds.totalServers > 0 || xs.totalServers > 0)
+    ? `<div class="text-muted small mt-1">Includes only Lift &amp; Shift servers. ${ds.totalServers > 0 ? ds.totalServers + " deferred to DR Strategy excluded. " : ""}${xs.totalServers > 0 ? xs.totalServers + " excluded from sizing." : ""}</div>`
+    : `<div class="text-muted small mt-1">Includes all ${s.totalServers || 0} sized servers.</div>`;
+  const pctBadge = (pct) => {
+    if (Math.abs(pct) < 0.1) return `<span class="badge bg-secondary">0%</span>`;
+    if (pct > 0) return `<span class="badge bg-success">−${pct}%</span>`;
+    return `<span class="badge bg-warning text-dark">+${Math.abs(pct)}%</span>`;
+  };
+  el.innerHTML = `
+    <div class="card border-info">
+      <div class="card-body py-2 px-3">
+        <h6 class="small fw-semibold mb-2 text-info"><i class="bi bi-arrows-collapse"></i> Sizing Optimisation Summary</h6>
+        <table class="table table-sm table-borderless mb-0 small align-middle">
+          <thead class="text-muted">
+            <tr>
+              <th></th>
+              <th class="text-end">Inventory (on-prem)</th>
+              <th class="text-end">Recommended (Azure L&amp;S)</th>
+              <th class="text-end">Reduction</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Servers</td><td class="text-end">${s.totalServers || 0}</td><td class="text-end">${s.totalServers || 0}</td><td class="text-end text-muted">—</td></tr>
+            <tr><td><strong>vCPU cores</strong></td><td class="text-end">${invCores.toLocaleString()}</td><td class="text-end fw-semibold">${recCores.toLocaleString()}</td><td class="text-end">${pctBadge(cpuPct)}</td></tr>
+            <tr><td><strong>RAM (GB)</strong></td><td class="text-end">${invRamGB.toLocaleString()}</td><td class="text-end fw-semibold">${recRamGB.toLocaleString()}</td><td class="text-end">${pctBadge(ramPct)}</td></tr>
+            <tr><td>Storage (TB)</td><td class="text-end">${storageTB}</td><td class="text-end">${storageTB}</td><td class="text-end text-muted">0% (size preserved)</td></tr>
+          </tbody>
+        </table>
+        ${scopeFootnote}
+        ${renderReconciliationLine(combined)}
+      </div>
+    </div>`;
+  el.classList.remove("hidden");
+}
+
+// One-line reconciliation: tells the user where every inventory server ended
+// up so missing-server complaints get answered before they're raised.
+// Surfaced as a yellow row when there's any unaccounted gap, gray when clean.
+function renderReconciliationLine(combined) {
+  const r = combined.reconciliation;
+  if (!r || !r.inventoryCount) return "";
+  const parts = [];
+  parts.push(`<strong>${r.inventoryCount}</strong> in inventory`);
+  parts.push(`<strong>${r.lnsCount}</strong> Lift &amp; Shift`);
+  if (r.deferredCount > 0) parts.push(`<strong>${r.deferredCount}</strong> Deferred to DR Strategy`);
+  if (r.excludedCount > 0) parts.push(`<strong>${r.excludedCount}</strong> Excluded`);
+  const gap = r.unaccountedCount;
+  const isClean = gap === 0;
+  const cls = isClean ? "text-muted" : "text-warning fw-semibold";
+  let html = `<div class="${cls} mt-2" style="font-size:0.78rem;"><i class="bi bi-${isClean ? 'check-circle' : 'exclamation-triangle'}"></i> Server reconciliation: ${parts.join(" \u00b7 ")}`;
+  if (!isClean) {
+    html += ` \u00b7 <strong>${gap} unaccounted</strong> (likely fell into 'Unknown' env from blank/duplicate hostnames in inventory \u2014 re-run after a fresh upload to fix).`;
+  } else {
+    html += ` \u00b7 all inventory servers accounted for.`;
+  }
+  html += `</div>`;
+  return html;
 }
 
 function renderEnvPricingSummary(containerId) {
@@ -1253,38 +1524,117 @@ function renderEnvPricingSummary(containerId) {
   if (envs.length <= 1 && envs[0] === "All") {
     // Single env — simple display
     const config = state.envConfigs["All"] || {};
-    const serverCount = state.envCounts?.["All"] || state.assessmentReport?.summary?.totalServers || 0;
+    const report = state.envReports?.["All"] || state.assessmentReport;
+    const serverCount = report?.summary?.totalServers || state.envCounts?.["All"] || 0;
+    const pricingLabel = pricingLabels[config.pricingModel] || config.pricingModel || "N/A";
+    const paygHrsSuffix = (config.pricingModel === "payg" && config.paygHoursPerMonth)
+      ? ` (${config.paygHoursPerMonth} hrs/mo)` : "";
+    const lic = computeEnvLicenseCores(report, config);
     container.innerHTML = `
       <div class="card border-0 bg-light">
-        <div class="card-body py-2 px-3 small">
-          <strong><i class="bi bi-geo-alt"></i> Region:</strong> ${esc(region)}
-          &nbsp;|&nbsp; <strong>Pricing:</strong> ${pricingLabels[config.pricingModel] || config.pricingModel || "N/A"}
-          &nbsp;|&nbsp; <strong>License:</strong> ${config.useAhub ? "Azure Hybrid Benefit (AHUB)" : "Pay As You Go"}
-          &nbsp;|&nbsp; <strong>Servers:</strong> ${serverCount}
+        <div class="card-body py-2 px-3">
+          <div class="small mb-1">
+            <strong><i class="bi bi-geo-alt"></i> Region:</strong> ${esc(region)}
+            &nbsp;|&nbsp; <strong>Pricing:</strong> ${pricingLabel}${paygHrsSuffix}
+            &nbsp;|&nbsp; <strong>License:</strong> ${config.useAhub ? "Azure Hybrid Benefit (AHUB)" : "Azure-included (no AHUB)"}
+            &nbsp;|&nbsp; <strong>Servers:</strong> ${serverCount}
+          </div>
+          ${renderLicenseChips(lic, config)}
         </div>
       </div>`;
   } else {
-    // Multi-env — show per-env breakdown
+    // Multi-env — show per-env breakdown with license cores per env
     let rows = "";
     for (const env of envs) {
       const config = state.envConfigs[env] || {};
-      const serverCount = state.envReports?.[env]?.summary?.totalServers || state.envCounts?.[env] || 0;
-      const pricing = pricingLabels[config.pricingModel] || config.pricingModel || "N/A";
-      const license = config.useAhub ? "AHUB" : "PAYG License";
-      rows += `<tr><td class="fw-semibold">${esc(env)}</td><td>${serverCount} servers</td><td>${pricing}</td><td>${license}</td></tr>`;
+      const report = state.envReports?.[env];
+      const serverCount = report?.summary?.totalServers || state.envCounts?.[env] || 0;
+      const pricingLabel = pricingLabels[config.pricingModel] || config.pricingModel || "N/A";
+      const paygHrsSuffix = (config.pricingModel === "payg" && config.paygHoursPerMonth)
+        ? ` (${config.paygHoursPerMonth} hrs/mo)` : "";
+      const license = config.useAhub ? "AHUB" : "Azure-included";
+      const lic = computeEnvLicenseCores(report, config);
+      const winCell = config.useAhub
+        ? `<span class="badge bg-warning text-dark" title="BYOL: customer must procure ${lic.winCores} Windows Server cores for AHUB">${lic.winCores || 0}</span>`
+        : `<span class="text-muted small" title="Windows Server licence is bundled into Azure compute price (no BYOL needed)">— Azure</span>`;
+      const sqlCell = lic.sqlCores > 0
+        ? `<span class="badge bg-warning text-dark" title="BYOL: customer must procure ${lic.sqlCores} SQL Server cores">${lic.sqlCores}</span>`
+        : `<span class="text-muted small">0</span>`;
+      const otherCell = lic.linuxCores > 0
+        ? `<span class="text-muted small" title="${lic.linuxCores} non-Windows cores. Most Linux VMs include the OS in the Azure price; RHEL/SUSE BYOS require licences.">${lic.linuxCores}</span>`
+        : `<span class="text-muted small">0</span>`;
+      rows += `<tr>
+        <td class="fw-semibold">${esc(env)}</td>
+        <td>${serverCount}</td>
+        <td>${pricingLabel}${paygHrsSuffix}</td>
+        <td>${license}</td>
+        <td class="text-end">${winCell}</td>
+        <td class="text-end">${sqlCell}</td>
+        <td class="text-end">${otherCell}</td>
+      </tr>`;
     }
     container.innerHTML = `
       <div class="card border-0 bg-light">
         <div class="card-body py-2 px-3">
           <div class="small mb-1"><strong><i class="bi bi-geo-alt"></i> Region:</strong> ${esc(region)}</div>
-          <table class="table table-sm table-borderless mb-0 small">
-            <thead><tr><th>Environment</th><th>Servers</th><th>Pricing Model</th><th>License</th></tr></thead>
+          <table class="table table-sm table-borderless mb-0 small align-middle">
+            <thead>
+              <tr>
+                <th>Environment</th>
+                <th>Servers</th>
+                <th>Pricing Model</th>
+                <th>License</th>
+                <th class="text-end" title="Windows Server cores customer must procure for AHUB. 0 when no AHUB (Azure-included).">Win Cores BYOL</th>
+                <th class="text-end" title="SQL Server cores customer must procure (BYOL).">SQL Cores BYOL</th>
+                <th class="text-end" title="Total non-Windows cores. Informational — most Linux is free; RHEL/SUSE BYOS need licences.">Other OS Cores</th>
+              </tr>
+            </thead>
             <tbody>${rows}</tbody>
           </table>
+          <div class="text-muted mt-1" style="font-size:0.7rem;">
+            <strong>BYOL = Bring Your Own License.</strong> Win Cores show <em>0</em> when AHUB is OFF because Azure includes the Windows Server licence in the compute price.
+            SQL is always BYOL. Other OS cores are informational (most Linux distros are free; RHEL/SUSE on BYOS require subscriptions).
+          </div>
         </div>
       </div>`;
   }
   container.classList.remove("hidden");
+}
+
+// Compute Windows / SQL / Linux core totals for an env's report. Used by both
+// the env-pricing summary table (Step 3/4) and the BOM XLSX export.
+function computeEnvLicenseCores(report, config) {
+  const out = { winCores: 0, sqlCores: 0, linuxCores: 0 };
+  if (!report || !report.servers) return out;
+  // Skip excluded/deferred rows: deferred rows are sized but not in this env's
+  // L&S total — they belong to the DR Strategy section, not Win/SQL BYOL.
+  for (const srv of report.servers) {
+    if (srv.costExcluded) continue;
+    const isWindows = srv.isWindows || /windows/i.test(srv.osName || "");
+    const cores = srv.vmCores || 0;
+    if (isWindows) out.winCores += cores;
+    else out.linuxCores += cores;
+    const nameLC = (srv.serverName || "").toLowerCase();
+    const osLC = (srv.osName || "").toLowerCase();
+    if (nameLC.includes("sql") || osLC.includes("sql")) out.sqlCores += cores;
+  }
+  // AHUB-off means Azure bundles the Windows licence — no BYOL needed.
+  if (config && config.useAhub === false) out.winCores = 0;
+  return out;
+}
+
+// Compact chip row used in the single-env summary card.
+function renderLicenseChips(lic, config) {
+  const winChip = config.useAhub
+    ? `<span class="badge bg-warning text-dark me-1" title="Customer must procure ${lic.winCores} Windows Server cores for AHUB">Win BYOL: ${lic.winCores} cores</span>`
+    : `<span class="badge bg-light text-dark border me-1">Win: Azure-included</span>`;
+  const sqlChip = lic.sqlCores > 0
+    ? `<span class="badge bg-warning text-dark me-1" title="SQL Server cores customer must procure (BYOL)">SQL BYOL: ${lic.sqlCores} cores</span>`
+    : `<span class="badge bg-light text-dark border me-1">SQL: 0 cores</span>`;
+  const otherChip = lic.linuxCores > 0
+    ? `<span class="badge bg-light text-dark border" title="Non-Windows cores. Most Linux is free; RHEL/SUSE BYOS need licences.">Other OS: ${lic.linuxCores} cores</span>`
+    : "";
+  return `<div class="small">${winChip}${sqlChip}${otherChip}</div>`;
 }
 
 // Run Assessment — multi-environment
@@ -1760,6 +2110,22 @@ function populateLZDropdown(selectId, componentData, defaultSku) {
   }
 }
 
+// Count Lift & Shift servers across all envs (i.e. servers whose compute is in
+// the primary L&S total). Excludes:
+//   - costExcluded (env or per-server)
+//   - costDeferredToDr (deferred to DR Strategy, e.g. DR env, or orphan-app pushed to DR)
+// Returns { total, deferred, excluded } so calc-info can explain what was filtered.
+function computeLnsServerCounts() {
+  const out = { total: 0, deferred: 0, excluded: 0 };
+  const servers = state.assessmentReport?.servers || [];
+  for (const s of servers) {
+    if (s.costExcluded) { out.excluded++; continue; }
+    if (s.costDeferredToDr) { out.deferred++; continue; }
+    out.total++;
+  }
+  return out;
+}
+
 function calculateEgressCost() {
   const egressEnabled = document.getElementById("egressEnabled").checked;
   const controlsDiv = document.getElementById("egressControls");
@@ -1776,7 +2142,16 @@ function calculateEgressCost() {
   controlsDiv.classList.remove("hidden");
 
   const method = document.getElementById("egressMethod").value;
-  const serverCount = state.assessmentReport ? state.assessmentReport.summary.totalServers : 0;
+  // Egress counts L&S servers only — i.e. servers whose compute lands in the
+  // primary Lift & Shift total. Excluded servers and DR-deferred servers are
+  // dropped because:
+  //   - excluded → not migrated, no egress
+  //   - deferred (cold ASR / Standard ASR target) → only replication traffic,
+  //     which is implicit in the DR Strategy cost line (storage row)
+  // Active-Active / Hot ASR DR servers DO produce egress, but their egress is
+  // app-specific and best estimated separately in deep assessment.
+  const lnsCounts = computeLnsServerCounts();
+  const serverCount = lnsCounts.total;
   const perServerGroup = document.getElementById("egressPerServerGroup");
   const totalGBInput = document.getElementById("egressTotalGB");
   const totalLabel = document.getElementById("egressTotalLabel");
@@ -1802,7 +2177,7 @@ function calculateEgressCost() {
     state.step5Costs.egress = 0;
     document.getElementById("egressCostBadge").textContent = `USD 0.00`;
     document.getElementById("egressCalcInfo").textContent = method === "per_server"
-      ? `Calc: ${serverCount} servers × 0 GB = 0 GB/mo → USD 0.00/mo`
+      ? `Calc: ${serverCount} L&S servers × 0 GB = 0 GB/mo → USD 0.00/mo`
       : `Calc: 0 GB/mo → USD 0.00/mo`;
     updateStep5Totals();
     return;
@@ -1830,12 +2205,17 @@ function calculateEgressCost() {
   state.step5Costs.egress = Math.round(cost * 100) / 100;
   document.getElementById("egressCostBadge").textContent = `USD ${fmtCost(cost)}`;
 
-  // Show calculation breakdown
+  // Show calculation breakdown + a sub-note explaining what was excluded so
+  // the user can audit the server count against their inventory.
   const infoEl = document.getElementById("egressCalcInfo");
+  const exclusions = [];
+  if (lnsCounts.deferred > 0) exclusions.push(`${lnsCounts.deferred} deferred to DR Strategy`);
+  if (lnsCounts.excluded > 0) exclusions.push(`${lnsCounts.excluded} excluded from sizing`);
+  const exclusionNote = exclusions.length > 0 ? ` (${exclusions.join(", ")})` : "";
   if (method === "per_server") {
-    infoEl.textContent = `Calc: ${serverCount} servers × ${parseFloat(document.getElementById("egressPerServer").value) || 0} GB = ${totalGB} GB/mo → USD ${fmtCost(cost)}/mo (first 5 GB free)`;
+    infoEl.textContent = `Calc: ${serverCount} L&S servers${exclusionNote} × ${parseFloat(document.getElementById("egressPerServer").value) || 0} GB = ${totalGB} GB/mo → USD ${fmtCost(cost)}/mo (first 5 GB free)`;
   } else {
-    infoEl.textContent = `Calc: ${totalGB} GB/mo → USD ${fmtCost(cost)}/mo (first 5 GB free, tiered pricing above)`;
+    infoEl.textContent = `Calc: ${totalGB} GB/mo → USD ${fmtCost(cost)}/mo (first 5 GB free, tiered pricing above)${exclusionNote ? ` · Server count for reference: ${serverCount}${exclusionNote}` : ""}`;
   }
   updateStep5Totals();
 }
@@ -1858,33 +2238,132 @@ function calculateLZCosts() {
 }
 
 function buildBCDREnvCheckboxes() {
-  const envs = state.environments || ["All"];
-  const backupContainer = document.getElementById("backupEnvCheckboxes");
-  const asrContainer = document.getElementById("asrEnvCheckboxes");
-  backupContainer.innerHTML = "";
-  asrContainer.innerHTML = "";
+  buildBackupEnvPolicyTable();
 
-  // Get server counts per env from envReports
-  for (const env of envs) {
-    const count = state.envReports[env]?.summary?.totalServers || state.assessmentReport?.summary?.totalServers || 0;
-    // Backup: default unchecked
-    backupContainer.innerHTML += `<label class="badge bg-light text-dark border small" style="cursor:pointer;">
-      <input type="checkbox" class="form-check-input me-1 backup-env-cb" value="${env}" data-count="${count}"> ${env} (${count})
-    </label>`;
-    // ASR: default only Prod selected
-    const asrChecked = env.toLowerCase() === "prod" ? "checked" : "";
-    asrContainer.innerHTML += `<label class="badge bg-light text-dark border small" style="cursor:pointer;">
-      <input type="checkbox" class="form-check-input me-1 asr-env-cb" value="${env}" ${asrChecked} data-count="${count}"> ${env} (${count})
-    </label>`;
-  }
-
-  // Attach listeners
-  document.querySelectorAll(".backup-env-cb").forEach(cb => cb.addEventListener("change", calculateBackupCost));
-  document.querySelectorAll(".asr-env-cb").forEach(cb => cb.addEventListener("change", calculateASRCost));
+  // Initialise the new DR Strategy matrix (replaces the old per-env ASR checkboxes)
+  initDrStrategy();
 
   // Pre-fill the Architecture Diagram inputs with sensible defaults from the
   // current session (customer name + target region + environments).
   prefillAlzDiagramInputs();
+}
+
+// Build the per-env backup policy table. Each detected env gets its own row
+// with: include checkbox, server count, retention dropdown, redundancy
+// dropdown, and a status badge for envs not in L&S scope.
+//
+// Defaults follow banking convention (where regulator-driven retention rules
+// dominate):  Production → 1 year + GRS, UAT → 90 days + LRS, everything else
+// → 30 days + LRS. User can override every row.
+function buildBackupEnvPolicyTable() {
+  const wrap = document.getElementById("backupEnvPolicies");
+  if (!wrap) return;
+  const envs = state.environments || ["All"];
+  // Persist per-env policy state so toggling Step 5 visits doesn't lose user's
+  // choices. Initialise once per env.
+  state.backupPolicies = state.backupPolicies || {};
+  for (const env of envs) {
+    if (!state.backupPolicies[env]) {
+      state.backupPolicies[env] = {
+        include: defaultBackupInclude(env),
+        retention: defaultBackupRetention(env),
+        redundancy: defaultBackupRedundancy(env),
+      };
+    }
+  }
+
+  const rowHtml = envs.map(env => {
+    const count = state.envReports[env]?.summary?.totalServers || state.assessmentReport?.summary?.totalServers || 0;
+    const cfg = state.envConfigs?.[env] || {};
+    const policy = state.backupPolicies[env];
+    const checked = policy.include ? "checked" : "";
+    const retOpts = ["30_days", "90_days", "1_year"].map(v =>
+      `<option value="${v}" ${policy.retention === v ? "selected" : ""}>${RETENTION_LABEL[v]}</option>`
+    ).join("");
+    const redOpts = [
+      { v: "lrs", label: "LRS — single zone" },
+      { v: "zrs", label: "ZRS — 3 zones, same region" },
+      { v: "grs", label: "GRS — paired region" },
+    ].map(o =>
+      `<option value="${o.v}" ${policy.redundancy === o.v ? "selected" : ""}>${o.label}</option>`
+    ).join("");
+    let scopeBadge = "";
+    if (cfg.costMode === "exclude") {
+      scopeBadge = `<span class="badge bg-warning text-dark ms-1" title="Excluded from VM Assessment">excluded</span>`;
+    } else if (cfg.costMode === "dr-defer") {
+      scopeBadge = `<span class="badge bg-info ms-1" title="Deferred to DR Strategy. Backing up DR replicas is uncommon — usually the AG/ASR replica IS the backup.">deferred</span>`;
+    }
+    return `<tr data-env="${escAttr(env)}">
+      <td><div class="form-check"><input class="form-check-input backup-env-include" type="checkbox" ${checked} id="bkupInc-${escAttr(env)}"><label class="form-check-label small fw-semibold" for="bkupInc-${escAttr(env)}">${esc(env)}</label>${scopeBadge}</div></td>
+      <td class="text-end small">${count}</td>
+      <td><select class="form-select form-select-sm backup-env-retention">${retOpts}</select></td>
+      <td><select class="form-select form-select-sm backup-env-redundancy">${redOpts}</select></td>
+    </tr>`;
+  }).join("");
+
+  wrap.innerHTML = `
+    <table class="table table-sm align-middle mb-0 small">
+      <thead class="table-light">
+        <tr>
+          <th>Environment</th>
+          <th class="text-end" style="width:80px;">Servers</th>
+          <th style="width:200px;">Retention</th>
+          <th style="width:130px;">Redundancy</th>
+        </tr>
+      </thead>
+      <tbody>${rowHtml}</tbody>
+    </table>`;
+
+  wrap.querySelectorAll(".backup-env-include, .backup-env-retention, .backup-env-redundancy").forEach(el => {
+    el.addEventListener("change", () => { capturePoliciesAndRecalc(); });
+  });
+}
+
+const RETENTION_LABEL = {
+  "30_days": "30 days (1.5× multiplier)",
+  "90_days": "90 days (2× multiplier)",
+  "1_year":  "1 year (3× multiplier)",
+};
+
+// Default include — same logic as the old per-env checkbox: deferred / excluded
+// envs are unchecked by default; everything else checked.
+function defaultBackupInclude(env) {
+  const cfg = state.envConfigs?.[env] || {};
+  if (cfg.costMode === "dr-defer" || cfg.costMode === "exclude") return false;
+  return true;
+}
+
+// Banking-default retention by env name. Conservative — Production gets 1 year
+// (BNM/MAS audit windows), UAT gets 90 days, everything else gets 30.
+function defaultBackupRetention(env) {
+  if (!env) return "30_days";
+  const norm = String(env).trim().toLowerCase().replace(/[\s_\-./]/g, "");
+  if (norm === "prod" || norm === "production") return "1_year";
+  if (norm === "uat" || norm === "stag" || norm === "staging" || norm === "preprod") return "90_days";
+  return "30_days";
+}
+
+// Banking-default redundancy: GRS for Prod (cross-region durability for audit),
+// LRS for everything else (operational recovery only, half the cost).
+function defaultBackupRedundancy(env) {
+  if (!env) return "lrs";
+  const norm = String(env).trim().toLowerCase().replace(/[\s_\-./]/g, "");
+  if (norm === "prod" || norm === "production") return "grs";
+  return "lrs";
+}
+
+// Read current row state into state.backupPolicies, then recalc.
+function capturePoliciesAndRecalc() {
+  const wrap = document.getElementById("backupEnvPolicies");
+  if (!wrap) return;
+  wrap.querySelectorAll("tr[data-env]").forEach(tr => {
+    const env = tr.getAttribute("data-env");
+    const include = tr.querySelector(".backup-env-include")?.checked || false;
+    const retention = tr.querySelector(".backup-env-retention")?.value || "30_days";
+    const redundancy = tr.querySelector(".backup-env-redundancy")?.value || "lrs";
+    state.backupPolicies[env] = { include, retention, redundancy };
+  });
+  calculateBackupCost();
 }
 
 // Default-fill the ALZ diagram form. Called from buildBCDREnvCheckboxes() so it
@@ -1906,61 +2385,1031 @@ function prefillAlzDiagramInputs() {
 
 function calculateBackupCost() {
   const pricing = state.backupPricing || { instanceFeePerVM: 10, storageLRSPerGB: 0.05, storageGRSPerGB: 0.10, retentionMultipliers: { "30_days": 1.5, "90_days": 2.0, "1_year": 3.0 } };
-  const retention = document.getElementById("backupRetention").value;
-  const redundancy = document.getElementById("backupRedundancy").value;
   const changeRate = parseFloat(document.getElementById("backupChangeRate").value) || 3;
-  const multiplier = pricing.retentionMultipliers[retention] || 1.5;
-  const storageRate = redundancy === "grs" ? pricing.storageGRSPerGB : pricing.storageLRSPerGB;
+  // Compression & dedup factor — Azure Backup gets typical 40-60% effective
+  // savings on incremental backups. Clamp to [0, 90]: 0 means no savings,
+  // 90 is an aggressive upper bound (VDI / heavily-templated VMs only).
+  let compression = parseFloat(document.getElementById("backupCompression")?.value);
+  if (!Number.isFinite(compression) || compression < 0) compression = 0;
+  if (compression > 90) compression = 90;
+  const compressionFactor = 1 - (compression / 100);
 
-  // Get selected env server counts + total disk
+  // Aggregate cost per env using each env's own retention/redundancy policy.
+  // This is the heart of the per-env model: each env sums its own source GB
+  // and applies its own multiplier+rate, then the totals roll up.
   let totalServers = 0;
-  let totalDiskGB = 0;
-  document.querySelectorAll(".backup-env-cb:checked").forEach(cb => {
-    const env = cb.value;
-    const report = state.envReports[env] || state.assessmentReport;
-    if (report) {
-      const servers = report.servers || [];
-      totalServers += servers.length;
-      for (const srv of servers) {
-        if (srv.diskDetails) {
-          for (const d of srv.diskDetails) totalDiskGB += (d.sourceSizeGB || 0);
-        }
-      }
-    }
-  });
+  let totalSourceGB = 0;
+  let totalRawBackupGB = 0;        // before compression
+  let totalEffectiveGB = 0;        // after compression — what Azure bills
+  let storageCost = 0;
+  let instanceCost = 0;
+  const outOfScope = [];           // envs included but not in L&S scope
+  const includedEnvs = [];         // for the per-env breakdown line
 
-  const backupStorageGB = Math.round(totalDiskGB * multiplier);
-  const instanceCost = totalServers * pricing.instanceFeePerVM;
-  const storageCost = backupStorageGB * storageRate;
+  const policies = state.backupPolicies || {};
+  // First pass: clear any prior per-server backup attribution. We'll set new
+  // values below for every server in an INCLUDED env. Servers in unincluded /
+  // deferred / excluded envs end up with backupMonthlyCost = 0.
+  const allServers = state.assessmentReport?.servers || [];
+  // Build a fast lookup: combined report has one row per server (env-tagged)
+  // so a Map by serverName lets us mirror per-server cost in O(1) instead of
+  // re-scanning for every env iteration. ABMB has 1281 servers — without this
+  // the inner find() turns the loop into ~1.2M ops on every backup recalc.
+  const combinedByName = new Map();
+  for (const srv of allServers) {
+    srv.backupMonthlyCost = 0;
+    combinedByName.set(srv.serverName, srv);
+  }
+  for (const env of (state.environments || [])) {
+    const report = state.envReports[env];
+    if (report) for (const srv of (report.servers || [])) srv.backupMonthlyCost = 0;
+  }
+
+  for (const env of (state.environments || [])) {
+    const policy = policies[env];
+    if (!policy || !policy.include) continue;
+    const cfg = state.envConfigs?.[env] || {};
+    if (cfg.costMode !== "lns") outOfScope.push({ env, mode: cfg.costMode });
+    const report = state.envReports[env];
+    if (!report) continue;
+    const servers = report.servers || [];
+    const multiplier = pricing.retentionMultipliers[policy.retention] || 1.5;
+    // Three-way redundancy lookup. ZRS lives in same region across availability
+    // zones — the right pick when data must stay in country (banking) but you
+    // still want datacenter-failure protection. Falls back to LRS if redundancy
+    // value is unrecognised so we never throw on a stale session.
+    const rate = policy.redundancy === "grs" ? pricing.storageGRSPerGB
+      : policy.redundancy === "zrs" ? (pricing.storageZRSPerGB || pricing.storageLRSPerGB * 1.25)
+      : pricing.storageLRSPerGB;
+    let envSourceGB = 0;
+    let envEffectiveGB = 0;
+    let envStorageCost = 0;
+    // Per-server stamping: each server's backup cost = its own disks × env policy.
+    // Sum-of-servers equals env total, so totals reconcile exactly.
+    for (const srv of servers) {
+      let srvSourceGB = 0;
+      if (srv.diskDetails) {
+        for (const d of srv.diskDetails) srvSourceGB += (d.sourceSizeGB || 0);
+      }
+      const srvEffectiveGB = srvSourceGB * multiplier * compressionFactor;
+      const srvStorageCost = srvEffectiveGB * rate;
+      const srvBackupTotal = srvStorageCost + pricing.instanceFeePerVM;
+      const rounded = Math.round(srvBackupTotal * 100) / 100;
+      // Stamp the cost on the env-level report row AND mirror it onto the
+      // combined report row so all downstream views (BOM, wave plan, exports)
+      // pick up the same number from whichever array they happen to read.
+      srv.backupMonthlyCost = rounded;
+      const combined = combinedByName.get(srv.serverName);
+      if (combined) combined.backupMonthlyCost = rounded;
+      envSourceGB += srvSourceGB;
+      envEffectiveGB += srvEffectiveGB;
+      envStorageCost += srvStorageCost;
+    }
+    const envRawGB = envSourceGB * multiplier;
+    const envInstanceCost = servers.length * pricing.instanceFeePerVM;
+    totalServers += servers.length;
+    totalSourceGB += envSourceGB;
+    totalRawBackupGB += envRawGB;
+    totalEffectiveGB += envEffectiveGB;
+    storageCost += envStorageCost;
+    instanceCost += envInstanceCost;
+    includedEnvs.push({
+      env, servers: servers.length,
+      sourceTB: (envSourceGB / 1024).toFixed(1),
+      retention: policy.retention,
+      redundancy: policy.redundancy,
+      cost: envStorageCost + envInstanceCost,
+    });
+  }
+
   const totalCost = Math.round((instanceCost + storageCost) * 100) / 100;
 
-  const backupTB = (backupStorageGB / 1024).toFixed(1);
-  document.getElementById("backupCalcInfo").textContent =
-    `${totalServers} servers, ${(totalDiskGB / 1024).toFixed(1)} TB source → ${backupTB} TB backup storage | Instance: $${fmtCost(instanceCost)} + Storage (${redundancy.toUpperCase()}): $${fmtCost(storageCost)}`;
+  const sourceTB = (totalSourceGB / 1024).toFixed(1);
+  const rawTB = (totalRawBackupGB / 1024).toFixed(1);
+  const effectiveTB = (totalEffectiveGB / 1024).toFixed(1);
+  const perServerInstance = totalServers > 0 ? (instanceCost / totalServers).toFixed(2) : "0.00";
+  const compNote = compression > 0
+    ? `${compression}% compression+dedup → ${effectiveTB} TB billable`
+    : `no compression assumed → ${rawTB} TB billable`;
+  const breakdownHtml = includedEnvs.length === 0
+    ? `<span class="text-muted">No environments selected for backup.</span>`
+    : includedEnvs.map(e =>
+        `<div class="small"><strong>${esc(e.env)}</strong>: ${e.servers} srv · ${e.sourceTB} TB · ${RETENTION_LABEL[e.retention] || e.retention} · ${e.redundancy.toUpperCase()} → <strong>USD ${fmtCost(e.cost)}/mo</strong></div>`
+      ).join("");
+  document.getElementById("backupCalcInfo").innerHTML =
+    `<strong>${totalServers} servers · ${sourceTB} TB source → ${rawTB} TB raw backup → ${compNote}</strong><br>` +
+    `Instance fee: $${fmtCost(instanceCost)} ($${perServerInstance}/server avg — Azure tiers per 500 GB of source size) · ` +
+    `Storage (mixed per-env policies): $${fmtCost(storageCost)}` +
+    `<div class="mt-1 ps-2 border-start">${breakdownHtml}</div>` +
+    `<span class="text-muted">Industry default 50% compression reflects typical Azure Backup. Tune for workload (VDI: 70-80% · encrypted DB: 10-20%).</span>`;
   document.getElementById("backupCostBadge").textContent = `USD ${fmtCost(totalCost)}/mo`;
 
+  // Out-of-scope warning. Inject/update a banner just above the calc-info line.
+  // Auto-removes when no out-of-scope envs are selected.
+  let warnEl = document.getElementById("backupScopeWarning");
+  if (outOfScope.length > 0) {
+    if (!warnEl) {
+      warnEl = document.createElement("div");
+      warnEl.id = "backupScopeWarning";
+      warnEl.className = "alert alert-warning small py-2 px-2 mb-2 mt-2";
+      const infoEl = document.getElementById("backupCalcInfo");
+      infoEl.parentNode.insertBefore(warnEl, infoEl);
+    }
+    const items = outOfScope.map(o => {
+      const tag = o.mode === "exclude"
+        ? `<strong>${esc(o.env)}</strong> is <em>excluded from VM Assessment</em> — those servers will not be migrated`
+        : `<strong>${esc(o.env)}</strong> is <em>deferred to DR Strategy</em> — the DR replicas are usually NOT separately backed up (AG / ASR replication serves that role)`;
+      return `<li>${tag}</li>`;
+    }).join("");
+    warnEl.innerHTML = `<i class="bi bi-exclamation-triangle"></i> <strong>Heads up — selected environments are not in Lift &amp; Shift scope:</strong><ul class="mb-0 mt-1">${items}</ul><div class="mt-1">Backup cost is still calculated as requested. Confirm during deep assessment whether you really need to back these up.</div>`;
+  } else if (warnEl) {
+    warnEl.remove();
+  }
+
   state.step5Costs.backup = totalCost;
-  state.step5BackupInfo = { servers: totalServers, storageTB: backupTB };
+  state.step5BackupInfo = { servers: totalServers, storageTB: effectiveTB, perEnv: includedEnvs };
   updateStep5Totals();
 }
 
 function calculateASRCost() {
-  const pricing = state.asrPricing || { pricePerServer: 25 };
-  let totalServers = 0;
-  document.querySelectorAll(".asr-env-cb:checked").forEach(cb => {
-    const env = cb.value;
-    const report = state.envReports[env] || state.assessmentReport;
-    if (report) totalServers += (report.servers || []).length;
-  });
-
-  const totalCost = Math.round(totalServers * pricing.pricePerServer * 100) / 100;
-  document.getElementById("asrCalcInfo").textContent = `${totalServers} servers × $${pricing.pricePerServer}/server = $${fmtCost(totalCost)}/mo`;
-  document.getElementById("asrCostBadge").textContent = `USD ${fmtCost(totalCost)}/mo`;
-
-  state.step5Costs.asr = totalCost;
-  state.step5ASRInfo = { servers: totalServers };
-  updateStep5Totals();
+  // Legacy entry-point kept for compatibility — delegates to the DR Strategy
+  // module which now owns the cost previously labelled "ASR".
+  return recalcDrStrategy();
 }
+
+// ============ DR STRATEGY MATRIX (replaces flat ASR checkboxes) ============
+// Cost categories returned by /api/dr-strategy/calculate map to a single line
+// item in the BOM. The badge in the card shows the rolling total for the
+// chosen criticality column + tier-strategy mapping. Switching the column or
+// any tier dropdown triggers a debounced recalc. Default per-tier strategy is
+// chosen from a built-in heuristic (matches the customer's MTD/RTO/RPO tiers
+// that show up most often in inventories: 1+/1/2/3/4 etc.).
+
+const DR_STRATEGY_OPTIONS = [
+  { id: "none",            label: "None (no DR)",                  rpo: 0, rto: 0 },
+  { id: "backup-restore",  label: "Backup-Restore (GRS)",           rpo: 24, rto: 24 },
+  { id: "std-asr",         label: "Standard ASR (cold DR)",         rpo: 0.25, rto: 4 },
+  { id: "hot-asr",         label: "Hot ASR (warm DR)",              rpo: 0.05, rto: 2 },
+  { id: "active-active",   label: "Active-Active (cross-region)",   rpo: 0,    rto: 0.5 },
+];
+
+// Default strategy hint for a tier value. Pure heuristic so the user lands on
+// something sensible immediately and can override per row. Order matters —
+// first matching pattern wins.
+function defaultStrategyFor(value) {
+  const v = String(value || "").toLowerCase().trim();
+  if (!v) return "none";
+  // Tier 1+/critical/zero-RPO → Hot ASR
+  if (/(^|\D)(1\+|t1\+|tier\s*1\+|critical|crit|gold|p0|s0|sev0|severity\s*0)(\D|$)/.test(v)) return "hot-asr";
+  // Tier 1 / high → Standard ASR
+  if (/(^|\D)(1|t1|tier\s*1|high|silver|p1|s1|sev1)(\D|$)/.test(v)) return "std-asr";
+  // Tier 2 / medium → Standard ASR
+  if (/(^|\D)(2|t2|tier\s*2|medium|med|bronze|p2|s2|sev2)(\D|$)/.test(v)) return "std-asr";
+  // Tier 3 / low → Backup-Restore
+  if (/(^|\D)(3|t3|tier\s*3|low|p3|s3|sev3)(\D|$)/.test(v)) return "backup-restore";
+  // Tier 4 / no-DR → None
+  if (/(^|\D)(4|t4|tier\s*4|none|no.?dr|n\/a|na)(\D|$)/.test(v)) return "none";
+  return "std-asr";
+}
+
+async function initDrStrategy() {
+  if (!state.sessionId || !state.assessmentReport) return;
+  // Reset any previous run's local state for this Step 5 visit.
+  state.drStrategy = state.drStrategy || { column: null, tierMap: {}, lastResult: null };
+  // Default ASR price from cached pricing (already fetched on Step 5 load)
+  const asrPriceInput = document.getElementById("drAsrPrice");
+  if (asrPriceInput && state.asrPricing?.pricePerServer) {
+    asrPriceInput.value = state.asrPricing.pricePerServer;
+  }
+  try {
+    const res = await fetch(`/api/dr-strategy/columns?sessionId=${encodeURIComponent(state.sessionId)}`, {
+      headers: state.tokenId ? { "X-Token-Id": state.tokenId } : {},
+    });
+    if (!res.ok) throw new Error(`columns ${res.status}`);
+    const data = await res.json();
+    state.drStrategy.candidates = data.candidates || [];
+    state.drStrategy.suggested = data.suggested;
+    populateDrColumnDropdown();
+  } catch (e) {
+    console.error("[DR Strategy] column fetch failed:", e.message);
+    document.getElementById("drStrategyCalcInfo").textContent = "Could not load criticality candidates.";
+  }
+  // Wire control listeners (idempotent — re-running buildBCDREnvCheckboxes is safe)
+  const colSel = document.getElementById("drCriticalityColumn");
+  if (colSel && colSel.dataset.bound !== "1") {
+    colSel.dataset.bound = "1";
+    colSel.addEventListener("change", () => { rebuildDrTierTable(); recalcDrStrategy(); });
+  }
+  const priceInput = document.getElementById("drAsrPrice");
+  if (priceInput && priceInput.dataset.bound !== "1") {
+    priceInput.dataset.bound = "1";
+    let debTimer = null;
+    priceInput.addEventListener("input", () => {
+      clearTimeout(debTimer);
+      debTimer = setTimeout(recalcDrStrategy, 300);
+    });
+  }
+  // Scope tabs replace the old "By Tier / By Application" toggle. Both views
+  // are now always visible — the tabs only switch which set of servers feeds
+  // the cost engine (deferred-only vs whole-estate). The Application Audit
+  // accordion below the tier table is independent of the scope.
+  const deferredTab = document.getElementById("drScopeDeferredTab");
+  const wholeTab = document.getElementById("drScopeWholeTab");
+  if (deferredTab && deferredTab.dataset.bound !== "1") {
+    deferredTab.dataset.bound = "1";
+    const switchScope = (s) => {
+      state.drStrategy = state.drStrategy || {};
+      state.drStrategy.scope = s;
+      deferredTab.classList.toggle("active", s === "deferred");
+      wholeTab.classList.toggle("active", s === "whole-estate");
+      rebuildDrTierTable();
+    };
+    deferredTab.addEventListener("click", () => switchScope("deferred"));
+    wholeTab.addEventListener("click", () => switchScope("whole-estate"));
+  }
+}
+
+function populateDrColumnDropdown() {
+  const sel = document.getElementById("drCriticalityColumn");
+  if (!sel) return;
+  const cands = state.drStrategy.candidates || [];
+  // Preserve selection if user already picked one
+  const current = sel.value;
+  sel.innerHTML = `<option value="">— None (no tiering) —</option>`;
+  for (const c of cands) {
+    const opt = document.createElement("option");
+    opt.value = c.column;
+    opt.textContent = `${c.column} (${c.distinctCount} values, ${c.coverage}% coverage)`;
+    sel.appendChild(opt);
+  }
+  if (current && cands.find(c => c.column === current)) {
+    sel.value = current;
+  } else if (state.drStrategy.suggested) {
+    sel.value = state.drStrategy.suggested;
+  }
+  const hint = document.getElementById("drCriticalityColumnHint");
+  if (hint) {
+    if (state.drStrategy.suggested) {
+      hint.textContent = `Auto-suggested: "${state.drStrategy.suggested}". Pick a different column if you tier servers another way.`;
+    } else {
+      hint.textContent = "No obvious tiering column found. Pick one or leave blank to apply a single strategy to all servers.";
+    }
+  }
+  rebuildDrTierTable();
+}
+
+function rebuildDrTierTable() {
+  const wrap = document.getElementById("drTierTableWrap");
+  if (!wrap) return;
+  const colSel = document.getElementById("drCriticalityColumn");
+  const column = colSel ? colSel.value : "";
+  const cands = state.drStrategy.candidates || [];
+  const cand = cands.find(c => c.column === column);
+  const scope = state.drStrategy?.scope === "whole-estate" ? "whole-estate" : "deferred";
+  // Per-tier server counts + source storage filtered by current scope.
+  // For the "Twins" column we ALSO compute env-distribution across the whole
+  // estate (not scope-filtered) so the user can see how each tier maps to
+  // primary apps regardless of which servers are being priced.
+  const tierStats = computeTierStats(column, scope);
+  const tierTwins = computeTierTwins(column);
+  // Update scope-tab badges with current counts so user sees scope sizes.
+  const allServers = state.assessmentReport?.servers || [];
+  const deferredCount = allServers.filter(s => s.costDeferredToDr && !s.costExcluded).length;
+  const wholeCount = allServers.filter(s => !s.costExcluded).length;
+  const dBadge = document.getElementById("drScopeDeferredCount");
+  const wBadge = document.getElementById("drScopeWholeCount");
+  if (dBadge) dBadge.textContent = deferredCount;
+  if (wBadge) wBadge.textContent = wholeCount;
+  // If user is on Deferred tab but nothing is deferred, we render but show a
+  // helpful empty-state message so they understand why no rows appear.
+  const noDeferred = scope === "deferred" && deferredCount === 0;
+
+  let rowsHtml = "";
+  let totalServers = 0, totalSourceTB = 0;
+  if (noDeferred) {
+    rowsHtml = `<tr><td colspan="7" class="text-center text-muted small py-3"><i class="bi bi-info-circle"></i> No environments are set to <strong>Defer to DR Strategy</strong> in VM Assess. Either go back to Step 3 and defer your DR env, or switch to <strong>Whole Estate</strong> above.</td></tr>`;
+  } else if (column && cand) {
+    state.drStrategy.tierMap = state.drStrategy.tierMap || {};
+    for (const v of cand.values) {
+      const stat = tierStats[v.value] || { count: 0, sourceTB: 0 };
+      // Skip tiers with zero servers in current scope (e.g. when on Deferred,
+      // tiers that have no DR-side servers shouldn't clutter the table).
+      if (stat.count === 0) continue;
+      const existing = state.drStrategy.tierMap[v.value] || {};
+      const strategy = existing.strategy || defaultStrategyFor(v.value);
+      const stratOpts = DR_STRATEGY_OPTIONS.map(o => `<option value="${o.id}" ${o.id === strategy ? "selected" : ""}>${o.label}</option>`).join("");
+      const def = DR_STRATEGY_OPTIONS.find(o => o.id === strategy) || DR_STRATEGY_OPTIONS[0];
+      const rpoVal = existing.rpoHours ?? def.rpo;
+      const rtoVal = existing.rtoHours ?? def.rto;
+      const tbStr = stat.sourceTB > 0 ? `${stat.sourceTB.toFixed(1)} TB` : "—";
+      totalServers += stat.count;
+      totalSourceTB += stat.sourceTB;
+      rowsHtml += `<tr data-tier="${escAttr(v.value)}">
+        <td class="fw-semibold">${esc(v.value)}</td>
+        <td class="text-end">${stat.count}</td>
+        <td class="text-end text-muted small" title="Total source disk size for this tier in the current scope">${tbStr}</td>
+        <td class="small text-muted" title="Distribution across environments (whole estate)">${formatTwinCounts(tierTwins[v.value])}</td>
+        <td><select class="form-select form-select-sm dr-strategy-sel">${stratOpts}</select></td>
+        <td><input type="text" class="form-control form-control-sm dr-rpo" value="${esc(formatHours(rpoVal))}" placeholder="hrs"></td>
+        <td><input type="text" class="form-control form-control-sm dr-rto" value="${esc(formatHours(rtoVal))}" placeholder="hrs"></td>
+        <td class="text-end" data-tier-cost>—</td>
+      </tr>`;
+    }
+    const unmappedExists = (tierStats["__unmapped__"]?.count || 0) > 0;
+    if (unmappedExists) {
+      const stat = tierStats["__unmapped__"];
+      const existing = state.drStrategy.tierMap["__unmapped__"] || {};
+      const strategy = existing.strategy || "none";
+      const stratOpts = DR_STRATEGY_OPTIONS.map(o => `<option value="${o.id}" ${o.id === strategy ? "selected" : ""}>${o.label}</option>`).join("");
+      const tbStr = stat.sourceTB > 0 ? `${stat.sourceTB.toFixed(1)} TB` : "—";
+      totalServers += stat.count;
+      totalSourceTB += stat.sourceTB;
+      rowsHtml += `<tr data-tier="__unmapped__" class="table-light">
+        <td class="fst-italic text-muted">(no value)</td>
+        <td class="text-end" data-unmapped-count>${stat.count}</td>
+        <td class="text-end text-muted small">${tbStr}</td>
+        <td class="small text-muted">${formatTwinCounts(tierTwins["__unmapped__"])}</td>
+        <td><select class="form-select form-select-sm dr-strategy-sel">${stratOpts}</select></td>
+        <td>—</td><td>—</td>
+        <td class="text-end" data-tier-cost>—</td>
+      </tr>`;
+    }
+  } else {
+    // Single bucket — no criticality column picked. Apply one strategy to everything.
+    const stat = tierStats["__default__"] || { count: 0, sourceTB: 0 };
+    const existing = state.drStrategy.tierMap["__default__"] || {};
+    const strategy = existing.strategy || "std-asr";
+    const stratOpts = DR_STRATEGY_OPTIONS.map(o => `<option value="${o.id}" ${o.id === strategy ? "selected" : ""}>${o.label}</option>`).join("");
+    const def = DR_STRATEGY_OPTIONS.find(o => o.id === strategy) || DR_STRATEGY_OPTIONS[0];
+    const tbStr = stat.sourceTB > 0 ? `${stat.sourceTB.toFixed(1)} TB` : "—";
+    totalServers += stat.count;
+    totalSourceTB += stat.sourceTB;
+    rowsHtml = `<tr data-tier="__default__">
+      <td class="fw-semibold">All servers</td>
+      <td class="text-end">${stat.count}</td>
+      <td class="text-end text-muted small">${tbStr}</td>
+      <td class="small text-muted">${formatTwinCounts(tierTwins["__default__"])}</td>
+      <td><select class="form-select form-select-sm dr-strategy-sel">${stratOpts}</select></td>
+      <td><input type="text" class="form-control form-control-sm dr-rpo" value="${esc(formatHours(existing.rpoHours ?? def.rpo))}" placeholder="hrs"></td>
+      <td><input type="text" class="form-control form-control-sm dr-rto" value="${esc(formatHours(existing.rtoHours ?? def.rto))}" placeholder="hrs"></td>
+      <td class="text-end" data-tier-cost>—</td>
+    </tr>`;
+  }
+
+  // Total row gets injected after the recalc updates costs (we read tier-cost
+  // cells once they're populated). For now placeholder is "—".
+  const totalRow = `<tr class="table-secondary fw-semibold" data-total-row>
+    <td>Total</td>
+    <td class="text-end">${totalServers}</td>
+    <td class="text-end small">${totalSourceTB > 0 ? totalSourceTB.toFixed(1) + " TB" : "—"}</td>
+    <td></td><td></td><td></td><td></td>
+    <td class="text-end" data-grand-cost>—</td>
+  </tr>`;
+
+  wrap.innerHTML = `
+    ${renderDrStrategyGuidance()}
+    ${renderScopeContextBanner(scope, totalServers, deferredCount, wholeCount)}
+    <table class="table table-sm table-bordered align-middle mb-0 small">
+      <thead class="table-light">
+        <tr>
+          <th>${column ? esc(column) : "Tier"}</th>
+          <th class="text-end" style="width:70px;" title="Servers in this tier within the selected scope">Servers</th>
+          <th class="text-end" style="width:80px;" title="Total source disk for this tier (in scope) \u2014 drives replicated-storage cost">Source</th>
+          <th style="width:140px;" title="Whole-estate distribution: how this tier's servers split across environments">App Twins</th>
+          <th style="width:230px;">DR Strategy</th>
+          <th style="width:90px;">RPO (hr)</th>
+          <th style="width:90px;">RTO (hr)</th>
+          <th class="text-end" style="width:130px;">Monthly Cost</th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}${rowsHtml.includes("data-tier") ? totalRow : ""}</tbody>
+    </table>`;
+  // Bind row inputs. Strategy-change auto-applies the strategy's RPO/RTO defaults
+  // so users see realistic numbers without having to type them.
+  wrap.querySelectorAll(".dr-strategy-sel").forEach(el => {
+    el.addEventListener("change", (e) => {
+      const tr = e.target.closest("tr[data-tier]");
+      const def = DR_STRATEGY_OPTIONS.find(o => o.id === e.target.value) || DR_STRATEGY_OPTIONS[0];
+      const rpoIn = tr.querySelector(".dr-rpo");
+      const rtoIn = tr.querySelector(".dr-rto");
+      if (rpoIn) rpoIn.value = formatHours(def.rpo);
+      if (rtoIn) rtoIn.value = formatHours(def.rto);
+      captureDrTierMap();
+      recalcDrStrategy();
+    });
+  });
+  wrap.querySelectorAll(".dr-rpo, .dr-rto").forEach(el => {
+    el.addEventListener("change", () => { captureDrTierMap(); recalcDrStrategy(); });
+    el.addEventListener("input", () => {
+      clearTimeout(state.drStrategy._inpTimer);
+      state.drStrategy._inpTimer = setTimeout(() => { captureDrTierMap(); recalcDrStrategy(); }, 350);
+    });
+  });
+  captureDrTierMap();
+  recalcDrStrategy();
+  // Always re-render the App Audit accordion content so it stays current.
+  renderDrAppView();
+}
+
+// Format env-distribution counts for the "App Twins" column.
+function formatTwinCounts(byEnv) {
+  if (!byEnv) return "—";
+  const ordered = ["Production", "Prod", "UAT", "SIT", "Development", "Dev", "Test", "DR"];
+  const seen = new Set();
+  const parts = [];
+  for (const o of ordered) {
+    if (byEnv[o] != null) { parts.push(`${byEnv[o]} ${o.slice(0, 4)}`); seen.add(o); }
+  }
+  for (const [k, v] of Object.entries(byEnv)) {
+    if (!seen.has(k)) parts.push(`${v} ${k.slice(0, 4)}`);
+  }
+  return parts.length === 0 ? "—" : parts.join(" \u00b7 ");
+}
+
+// Compact context banner so the user always knows which servers are being priced.
+function renderScopeContextBanner(scope, totalInTable, deferredCount, wholeCount) {
+  if (scope === "whole-estate") {
+    return `<div class="alert alert-secondary py-1 px-2 small mb-2"><i class="bi bi-globe"></i>
+      <strong>Whole Estate scope:</strong> applying DR to all ${wholeCount} non-excluded servers (what-if scenario).
+      Deferred-only scope shows ${deferredCount} servers.</div>`;
+  }
+  if (deferredCount === 0) {
+    return `<div class="alert alert-warning py-1 px-2 small mb-2"><i class="bi bi-exclamation-triangle"></i>
+      <strong>No deferred servers.</strong> Either go back to Step 3 and set an env (typically <code>DR</code>)
+      to <em>Defer to DR Strategy</em>, or switch to <strong>Whole Estate</strong> to apply DR across all servers.</div>`;
+  }
+  return `<div class="alert alert-info py-1 px-2 small mb-2"><i class="bi bi-shield-check"></i>
+    <strong>Deferred Servers scope:</strong> applying DR to the ${deferredCount} servers your VM Assess marked as
+    <em>Defer to DR Strategy</em> (typically the DR site replicas).</div>`;
+}
+
+// Format an RPO/RTO hour value for display. Strings (e.g. "—" for None
+// strategy) pass through; numbers are normalised so 0.1 stays "0.1" but
+// 24.000 becomes "24".
+function formatHours(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v;
+  if (!Number.isFinite(v)) return "";
+  if (v === 0) return "0";
+  if (v < 1) return v.toString(); // "0.1", "0.25"
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+// Aggregate per-tier server counts + total source disk size, FILTERED BY SCOPE.
+// Used by the table to show counts that match the cost engine's scope.
+function computeTierStats(column, scope) {
+  const out = {};
+  const servers = state.assessmentReport?.servers || [];
+  for (const s of servers) {
+    if (s.costExcluded) continue;
+    if (scope === "deferred" && !s.costDeferredToDr) continue;
+    // 'whole-estate': include everything (excluded already filtered above)
+    const tier = column ? ((s.extraColumns || {})[column] || "").toString().trim() || "__unmapped__" : "__default__";
+    if (!out[tier]) out[tier] = { sourceTB: 0, count: 0 };
+    out[tier].count++;
+    let sumGB = 0;
+    for (const d of (s.diskDetails || [])) sumGB += (d.sourceSizeGB || 0);
+    out[tier].sourceTB += sumGB / 1024;
+  }
+  return out;
+}
+
+// Count distribution of tier values across environments (whole estate, never
+// scope-filtered). Used by the "App Twins" column so the user always sees
+// e.g. "Tier 1: 2 Prod · 1 UAT · 1 DR" regardless of which scope is active.
+function computeTierTwins(column) {
+  const out = {};
+  const servers = state.assessmentReport?.servers || [];
+  for (const s of servers) {
+    if (s.costExcluded) continue;
+    const tier = column ? ((s.extraColumns || {})[column] || "").toString().trim() || "__unmapped__" : "__default__";
+    if (!out[tier]) out[tier] = {};
+    const env = s.environment || "Unknown";
+    out[tier][env] = (out[tier][env] || 0) + 1;
+  }
+  return out;
+}
+
+// One-off help card explaining what each Azure DR pattern achieves so users
+// can match RTO/RPO targets to the right strategy. Particularly useful for
+// banking customers with strict tier-based DR policies (RPO≈0 → AA / Hot ASR,
+// RPO 24hr → Standard ASR / Backup-Restore, etc.).
+function renderDrStrategyGuidance() {
+  const collapsed = state.drStrategy?._guidanceCollapsed ? "" : "show";
+  return `
+    <div class="accordion accordion-flush mb-2" id="drGuidanceAcc">
+      <div class="accordion-item border rounded">
+        <h2 class="accordion-header">
+          <button class="accordion-button collapsed py-2 small" type="button" data-bs-toggle="collapse" data-bs-target="#drGuidanceBody">
+            <i class="bi bi-info-circle me-1"></i> How to match RTO/RPO targets to the right strategy
+          </button>
+        </h2>
+        <div id="drGuidanceBody" class="accordion-collapse collapse ${collapsed}">
+          <div class="accordion-body py-2 small">
+            <table class="table table-sm table-borderless mb-0 small">
+              <thead class="table-light">
+                <tr><th>Strategy</th><th>Achievable RPO</th><th>Achievable RTO</th><th>What you pay</th><th>Use when…</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><strong>Active-Active</strong></td><td><strong>0 (sync)</strong></td><td>≤30 min</td><td>100% DR compute + 100% storage</td><td>RPO must be zero. Mission-critical, regulator demands continuous availability.</td></tr>
+                <tr><td><strong>Hot ASR</strong></td><td>seconds (near 0)</td><td>≤2 hr</td><td>30% DR compute + storage + ASR licence</td><td>Near-zero RPO acceptable, RTO ≤4hr. Warm DR pool means fast failover.</td></tr>
+                <tr><td><strong>Standard ASR</strong></td><td>~15 min</td><td>≤4 hr (≤24 hr with config)</td><td>0 standing compute + storage + ASR licence</td><td>RPO ≤1hr, RTO ≤24hr. DR VMs spin up only on failover. Most cost-effective for tiered workloads.</td></tr>
+                <tr><td><strong>Backup-Restore</strong></td><td>24 hr (daily)</td><td>~24 hr</td><td>GRS backup storage (already in Backup line)</td><td>RPO 24hr+ acceptable, RTO 24hr+ acceptable. Cheapest DR, but slowest recovery.</td></tr>
+                <tr><td><strong>None</strong></td><td>—</td><td>—</td><td>0</td><td>App not in DR scope. Best-effort recovery from fresh build / source.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function captureDrTierMap() {
+  const wrap = document.getElementById("drTierTableWrap");
+  if (!wrap) return;
+  const map = {};
+  wrap.querySelectorAll("tr[data-tier]").forEach(tr => {
+    const key = tr.getAttribute("data-tier");
+    const strategy = tr.querySelector(".dr-strategy-sel")?.value || "none";
+    const rpoStr = tr.querySelector(".dr-rpo")?.value;
+    const rtoStr = tr.querySelector(".dr-rto")?.value;
+    // parseFloat handles "0.25" / "24" / "0.05" cleanly. Empty / "—" / NaN
+    // fall back to the strategy's default so the cell is never silently null.
+    const def = DR_STRATEGY_OPTIONS.find(o => o.id === strategy) || DR_STRATEGY_OPTIONS[0];
+    const rpoP = rpoStr === undefined ? NaN : parseFloat(rpoStr);
+    const rtoP = rtoStr === undefined ? NaN : parseFloat(rtoStr);
+    const rpo = Number.isFinite(rpoP) ? rpoP : (Number.isFinite(def.rpo) ? def.rpo : null);
+    const rto = Number.isFinite(rtoP) ? rtoP : (Number.isFinite(def.rto) ? def.rto : null);
+    map[key] = { strategy, rpoHours: rpo, rtoHours: rto };
+  });
+  state.drStrategy.tierMap = map;
+}
+
+async function recalcDrStrategy() {
+  if (!state.sessionId || !state.assessmentReport) return;
+  const colSel = document.getElementById("drCriticalityColumn");
+  const column = colSel ? colSel.value : "";
+  const asrPrice = parseFloat(document.getElementById("drAsrPrice")?.value) || 25;
+  const tierMap = state.drStrategy?.tierMap || {};
+  const scope = state.drStrategy?.scope === "whole-estate" ? "whole-estate" : "deferred";
+  try {
+    const res = await fetch("/api/dr-strategy/calculate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(state.tokenId ? { "X-Token-Id": state.tokenId } : {}) },
+      body: JSON.stringify({ sessionId: state.sessionId, column, tierMap, asrPricePerServer: asrPrice, scope }),
+    });
+    if (!res.ok) throw new Error(`calc ${res.status}`);
+    const data = await res.json();
+    state.drStrategy.lastResult = data;
+    // Backend may have downgraded scope (e.g. user picked deferred but nothing
+    // is deferred) — reflect the final scope it used.
+    if (data.scope) state.drStrategy.scope = data.scope;
+    renderDrStrategyResult(data);
+    // Push the rolled-up cost into Step 5's existing structure so BOM and
+    // step5GrandTotal continue to work without changes.
+    state.step5Costs.asr = data.totals.monthlyCost;
+    state.step5ASRInfo = {
+      servers: (data.tierResults || []).reduce((a, r) => a + (r.serverCount || 0), 0),
+      strategies: data.tierResults.map(r => `${r.tier}=${r.strategy}`).join(", "),
+    };
+    updateStep5Totals();
+  } catch (e) {
+    console.error("[DR Strategy] recalc failed:", e.message);
+    document.getElementById("drStrategyCalcInfo").textContent = `Calculation failed: ${e.message}`;
+  }
+}
+
+function renderDrStrategyResult(data) {
+  const wrap = document.getElementById("drTierTableWrap");
+  if (!wrap) return;
+  const byTier = {};
+  for (const t of (data.tierResults || [])) byTier[t.tierKey] = t;
+  wrap.querySelectorAll("tr[data-tier]").forEach(tr => {
+    const key = tr.getAttribute("data-tier");
+    const t = byTier[key];
+    const cell = tr.querySelector("[data-tier-cost]");
+    if (cell) cell.textContent = t ? `USD ${fmtCost(t.monthlyCost)}` : "—";
+    const unmappedCount = tr.querySelector("[data-unmapped-count]");
+    if (unmappedCount && t) unmappedCount.textContent = t.serverCount;
+  });
+  // Populate the grand-total row's cost cell so the matrix self-reconciles.
+  const grandCell = wrap.querySelector("[data-grand-cost]");
+  if (grandCell) grandCell.textContent = `USD ${fmtCost(data.totals?.monthlyCost || 0)}`;
+  const total = data.totals?.monthlyCost || 0;
+  document.getElementById("drStrategyCostBadge").textContent = `USD ${fmtCost(total)}/mo`;
+  // Calc-info line: explain the totals and any unmapped count.
+  const totals = data.totals || {};
+  const parts = [
+    `Compute USD ${fmtCost(totals.drCompute || 0)}`,
+    `Storage USD ${fmtCost(totals.drStorage || 0)}`,
+    `Licence USD ${fmtCost(totals.drLicense || 0)}`,
+  ];
+  document.getElementById("drStrategyCalcInfo").textContent = `Total: ${parts.join("  ·  ")}.`;
+  // App audit accordion always renders \u2014 keep its content in sync with the
+  // latest pairing snapshot whenever the strategy result lands.
+  renderDrAppView();
+  // Conflict check: if the user left a DR-named env in 'Lift & Shift' mode AND
+  // they're now applying a DR strategy, the same servers are double-counted
+  // (once in L&S compute total, once in this DR Strategy box). Surface a
+  // warning with a one-click "defer" button so the BOM stays defensible.
+  renderDrConflictWarning();
+}
+
+// Detect environments whose name looks like 'DR' but whose costMode is still
+// the default 'lns'. When a DR Strategy is active these servers are paying
+// twice. We surface a banner above the matrix with a one-click fix.
+function renderDrConflictWarning() {
+  const wrap = document.getElementById("drTierTableWrap");
+  if (!wrap || !wrap.parentNode) return;
+  let banner = document.getElementById("drConflictBanner");
+  const drNameRegex = /^(dr|d\.?r|disaster.?recovery|dr.?site)$/i;
+  const conflicting = (state.environments || []).filter(env => {
+    const norm = String(env || "").trim().toLowerCase().replace(/[\s_\-./]/g, "");
+    const looksLikeDr = norm === "dr" || norm === "drsite" || norm === "disasterrecovery";
+    const cfg = state.envConfigs[env] || {};
+    return looksLikeDr && (cfg.costMode || "lns") === "lns";
+  });
+  if (conflicting.length === 0) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "drConflictBanner";
+    banner.className = "alert alert-warning py-2 px-3 small mb-2 d-flex align-items-start gap-2";
+    wrap.parentNode.insertBefore(banner, wrap);
+  }
+  const envList = conflicting.map(e => `<strong>${esc(e)}</strong>`).join(", ");
+  const totalSrv = conflicting.reduce((a, e) => a + (state.envReports?.[e]?.summary?.totalServers || 0), 0);
+  banner.innerHTML = `
+    <i class="bi bi-exclamation-triangle-fill text-warning"></i>
+    <div class="flex-grow-1">
+      <strong>Possible double-count:</strong> ${envList} (${totalSrv} servers) is still in <em>Lift &amp; Shift</em> mode while a DR Strategy is being applied above.
+      The DR-side compute for those servers is counted twice — once as L&amp;S compute, once as DR Strategy cost.
+      Move the DR environment to <em>Defer to DR Strategy</em> so its sized SKUs feed the strategy multiplier (Hot ASR / Active-Active) without inflating the L&amp;S total.
+    </div>
+    <button type="button" class="btn btn-warning btn-sm" id="drDeferEnvBtn">
+      <i class="bi bi-shield-check"></i> Defer ${conflicting.length === 1 ? "this env" : "these envs"} now
+    </button>`;
+  document.getElementById("drDeferEnvBtn")?.addEventListener("click", async () => {
+    for (const env of conflicting) {
+      const cfg = state.envConfigs[env] = state.envConfigs[env] || {};
+      cfg.costMode = "dr-defer";
+      // Reflect in the env-tab dropdown so the user sees the change visually
+      const envId = env.replace(/[^a-zA-Z0-9]/g, "_");
+      const sel = document.getElementById(`costMode-${envId}`);
+      if (sel) sel.value = "dr-defer";
+      // Trigger an instant cost-only recalc on the env (no re-matching needed
+      // for an lns→dr-defer flip — the rows are already sized).
+      await recalculateEnv(env);
+    }
+    // Re-run DR strategy to reflect the new (smaller) primary base.
+    recalcDrStrategy();
+  });
+}
+
+// switchDrView() removed — the old tier/app toggle was replaced by Scope tabs
+// (Deferred Servers vs Whole Estate). Both tier matrix and app audit are now
+// always rendered: tier table on top, app audit accordion below.
+
+function renderDrAppView() {
+  const wrap = document.getElementById("drAppTableWrap");
+  if (!wrap) return;
+  const pairing = state.assessmentReport?.applicationPairing;
+  if (!pairing || !pairing.column || !pairing.apps?.length) {
+    wrap.innerHTML = `<div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle"></i> No <strong>Business Application</strong> column found in the inventory. Reconciliation view needs an app column to pair DR servers with their primary counterparts.</div>`;
+    return;
+  }
+  const result = state.drStrategy?.lastResult;
+  const colSel = document.getElementById("drCriticalityColumn");
+  const tierColumn = colSel?.value || "";
+
+  // Build a quick lookup: for each server, what tier value does it have?
+  const tierByServer = new Map();
+  if (tierColumn) {
+    for (const s of state.assessmentReport.servers) {
+      tierByServer.set(s.serverName, ((s.extraColumns || {})[tierColumn] || "").toString().trim() || "(no value)");
+    }
+  }
+  const strategyByTier = new Map();
+  for (const t of (result?.tierResults || [])) strategyByTier.set(t.tierKey, t.strategy);
+
+  // For each app, determine its dominant tier (most common tier value among its servers)
+  // and roll up its DR-side cost from its servers' contribution.
+  const rows = pairing.apps.map(app => {
+    const counts = { prod: 0, uat: 0, dr: 0, other: 0, total: app.total };
+    for (const s of app.servers) {
+      const e = (s.env || "").toLowerCase();
+      if (/^prod/.test(e)) counts.prod++;
+      else if (/^uat/.test(e)) counts.uat++;
+      else if (/^dr|disaster/.test(e)) counts.dr++;
+      else counts.other++;
+    }
+    // Dominant tier among this app's servers
+    const tierCounts = new Map();
+    for (const s of app.servers) {
+      const t = tierByServer.get(s.name) || "(no value)";
+      tierCounts.set(t, (tierCounts.get(t) || 0) + 1);
+    }
+    let dominantTier = "(no value)";
+    let dominantCount = 0;
+    for (const [t, c] of tierCounts) if (c > dominantCount) { dominantTier = t; dominantCount = c; }
+    const tierKey = dominantTier === "(no value)" ? "__unmapped__" : dominantTier;
+    const strategy = strategyByTier.get(tierKey) || "none";
+    return { app: app.name, tier: dominantTier, strategy, counts, pairingStatus: app.pairingStatus || "no-dr" };
+  }).sort((a, b) => b.counts.total - a.counts.total);
+
+  const stratLabel = id => (DR_STRATEGY_OPTIONS.find(o => o.id === id) || {}).label || id;
+
+  // Categorise apps that have DR servers into 3 groups for the fix-it section
+  const orphanApps = rows.filter(r => r.pairingStatus === "orphan-dr");
+  const uatOnlyApps = rows.filter(r => r.pairingStatus === "uat-only");
+  const pairedApps = rows.filter(r => r.pairingStatus === "paired");
+  const allAppsForDropdown = pairing.apps.map(a => a.name).sort();
+  const decisions = state.drStrategy?.orphanDecisions || {};
+
+  // Helper: render the fix-it card for one orphan / uat-only app.
+  // Default action = "lns" (Keep in L&S) for pre-sales conservative pricing.
+  function fixItCard(r, isUatOnly) {
+    const dec = decisions[r.app] || { action: "lns" };
+    const action = dec.action || "lns";
+    const stratValue = dec.strategy || "std-asr";
+    const mapValue = dec.mapToApp || "";
+    const stratOpts = DR_STRATEGY_OPTIONS.filter(o => o.id !== "none").map(o =>
+      `<option value="${o.id}" ${stratValue === o.id ? "selected" : ""}>${o.label}</option>`).join("");
+    const mapOpts = `<option value="">— pick app —</option>` + allAppsForDropdown
+      .filter(a => a !== r.app)
+      .map(a => `<option value="${escAttr(a)}" ${mapValue === a ? "selected" : ""}>${esc(a)}</option>`).join("");
+    const sel = (val) => action === val ? "checked" : "";
+    const subRowsVisible = (val) => action === val ? "" : "hidden";
+    const cardClass = isUatOnly ? "border-info" : "border-warning";
+    const headerClass = isUatOnly ? "text-info" : "text-warning";
+    const headerIcon = isUatOnly ? "bi-info-circle" : "bi-exclamation-triangle";
+    const headerLabel = isUatOnly
+      ? `Paired with UAT only (no Production twin)`
+      : `Orphan — no Prod/UAT/SIT/Dev twin`;
+    return `
+      <div class="card ${cardClass} mb-2" data-orphan-app="${escAttr(r.app)}">
+        <div class="card-body p-2">
+          <div class="d-flex justify-content-between align-items-start mb-2 flex-wrap gap-2">
+            <div>
+              <strong>${esc(r.app)}</strong>
+              <span class="badge bg-light text-dark border ms-2">${r.counts.dr} DR ${r.counts.dr === 1 ? "server" : "servers"}</span>
+              <span class="badge bg-light text-dark border ms-1">${r.counts.uat || 0} UAT</span>
+              <span class="badge bg-light text-dark border ms-1">${r.counts.prod || 0} Prod</span>
+            </div>
+            <small class="${headerClass}"><i class="bi ${headerIcon}"></i> ${headerLabel}</small>
+          </div>
+          <div class="d-flex flex-column gap-1">
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 orphan-action" name="orphan-${escAttr(r.app)}" value="lns" ${sel("lns")}>
+              <span><strong>Keep in Lift &amp; Shift total</strong> <span class="badge bg-success-subtle text-success-emphasis border border-success-subtle">recommended for pre-sales</span><br>
+              <span class="text-muted">Conservative pricing — every server is counted. Validate at deep assessment whether they are shared infra (keep), mislabelled (re-tag), or ghost (exclude).</span></span>
+            </label>
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 orphan-action" name="orphan-${escAttr(r.app)}" value="dr-strategy" ${sel("dr-strategy")}>
+              <span><strong>Apply DR strategy directly</strong><br>
+              <span class="text-muted">Use when these are confirmed DR servers for shared infra (e.g. AD DCs at the DR site).</span>
+              <span class="d-inline-block ${subRowsVisible("dr-strategy")} mt-1" data-sub="dr-strategy">
+                <select class="form-select form-select-sm orphan-strategy" style="display:inline-block; width:auto;">${stratOpts}</select>
+              </span></span>
+            </label>
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 orphan-action" name="orphan-${escAttr(r.app)}" value="map" ${sel("map")}>
+              <span><strong>Mapped to a primary app</strong> (mislabelled inventory)<br>
+              <span class="text-muted">Reconciles this app to another — useful when the inventory tag is wrong.</span>
+              <span class="d-inline-block ${subRowsVisible("map")} mt-1" data-sub="map">
+                <select class="form-select form-select-sm orphan-map" style="display:inline-block; width:auto;">${mapOpts}</select>
+              </span></span>
+            </label>
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 orphan-action" name="orphan-${escAttr(r.app)}" value="exclude" ${sel("exclude")}>
+              <span><strong>Exclude from migration</strong><br>
+              <span class="text-muted">Use only when confirmed ghost / decommissioned. Validate with the customer first.</span></span>
+            </label>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  const orphanFixItHtml = (orphanApps.length === 0 && uatOnlyApps.length === 0)
+    ? `<div class="alert alert-success small mb-2"><i class="bi bi-check-circle"></i> <strong>All DR servers are paired with a Prod or UAT counterpart</strong> — no orphans.</div>`
+    : `
+      <div class="alert alert-warning small mb-2 py-2">
+        <i class="bi bi-exclamation-triangle"></i>
+        <strong>${orphanApps.length + uatOnlyApps.length} app${(orphanApps.length + uatOnlyApps.length) === 1 ? " has" : "s have"} DR servers without a clear Production twin.</strong>
+        Default treatment is <strong>Keep in Lift &amp; Shift</strong> (conservative pre-sales pricing). Review each below and refine during deep assessment.
+      </div>
+      <div class="row g-2 mb-3">
+        <div class="col-12">
+          ${orphanApps.map(r => fixItCard(r, false)).join("")}
+          ${uatOnlyApps.map(r => fixItCard(r, true)).join("")}
+        </div>
+      </div>`;
+
+  // SQL replica candidates section — apps that have BOTH a Prod SQL VM AND a
+  // DR SQL VM. Default treatment is Always-On AG / Mirroring (active-active)
+  // because that's both the common DBA pattern AND the conservative-pricing
+  // choice (Active-Active > Standard ASR). User can downgrade per app.
+  const sqlCandidates = state.assessmentReport?.sqlReplicaCandidates || [];
+  const sqlDecisions = state.drStrategy?.sqlDecisions || {};
+  const sqlCard = (cand) => {
+    const dec = sqlDecisions[cand.app] || { action: "ag" };
+    const action = dec.action || "ag";
+    const sel = (v) => action === v ? "checked" : "";
+    return `
+      <div class="card border-primary mb-2" data-sql-app="${escAttr(cand.app)}">
+        <div class="card-body p-2">
+          <div class="d-flex justify-content-between align-items-start mb-2 flex-wrap gap-2">
+            <div>
+              <strong>${esc(cand.app)}</strong>
+              <span class="badge bg-light text-dark border ms-2">${cand.sqlProdCount} Prod SQL</span>
+              <span class="badge bg-light text-dark border ms-1">${cand.sqlDrCount} DR SQL</span>
+            </div>
+            <small class="text-primary"><i class="bi bi-database"></i> SQL replica candidate</small>
+          </div>
+          <div class="text-muted small mb-2">
+            Prod SQL: <code>${cand.sqlProdServers.map(esc).join(", ")}</code><br>
+            DR SQL: <code>${cand.sqlDrServers.map(esc).join(", ")}</code>
+          </div>
+          <div class="d-flex flex-column gap-1">
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 sql-action" name="sql-${escAttr(cand.app)}" value="ag" ${sel("ag")}>
+              <span><strong>SQL Always-On AG / Database Mirroring</strong> <span class="badge bg-success-subtle text-success-emphasis border border-success-subtle">recommended</span><br>
+              <span class="text-muted">DR SQL VMs treated as <em>active-active</em> replicas — sized at 100% compute, full storage, no ASR licence. Failover handled by SQL AG, not ASR.</span></span>
+            </label>
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 sql-action" name="sql-${escAttr(cand.app)}" value="asr" ${sel("asr")}>
+              <span><strong>Standalone SQL with ASR</strong><br>
+              <span class="text-muted">DR SQL VMs treated as cold ASR target — 0 standing compute, full replicated storage, ASR licence per VM. Use only when SQL is NOT in an AG.</span></span>
+            </label>
+            <label class="small d-flex align-items-start gap-2">
+              <input type="radio" class="form-check-input mt-1 sql-action" name="sql-${escAttr(cand.app)}" value="tier" ${sel("tier")}>
+              <span><strong>Use this app's tier strategy</strong><br>
+              <span class="text-muted">SQL servers follow whatever DR strategy was assigned to this app's tier (no special handling).</span></span>
+            </label>
+          </div>
+        </div>
+      </div>`;
+  };
+  const sqlFixItHtml = sqlCandidates.length === 0 ? "" : `
+    <div class="alert alert-info small mb-2 py-2">
+      <i class="bi bi-database"></i>
+      <strong>${sqlCandidates.length} app${sqlCandidates.length === 1 ? " has" : "s have"} SQL servers in both Prod and DR.</strong>
+      These are likely <strong>SQL Always-On AG or Database Mirroring</strong> setups — DR-side SQL VMs run 24×7 as active replicas, not as cold ASR targets.
+      Default treatment is Always-On AG. Confirm or override per app below.
+    </div>
+    <div class="row g-2 mb-3">
+      <div class="col-12">
+        ${sqlCandidates.map(sqlCard).join("")}
+      </div>
+    </div>`;
+
+  // Paired apps go in the standard reconciliation table.
+  const tableHtml = pairedApps.length === 0 ? "" : `
+    <h6 class="small mb-1">Paired applications (${pairedApps.length})</h6>
+    <div class="table-responsive" style="max-height:340px;">
+      <table class="table table-sm table-bordered align-middle small mb-0">
+        <thead class="table-light position-sticky top-0">
+          <tr>
+            <th>Business Application</th>
+            <th class="text-end">Total</th>
+            <th class="text-end">Prod</th>
+            <th class="text-end">UAT</th>
+            <th class="text-end">DR</th>
+            <th>Tier</th>
+            <th>Strategy</th>
+          </tr>
+        </thead>
+        <tbody>${pairedApps.map(r => `<tr>
+          <td class="fw-semibold">${esc(r.app)}</td>
+          <td class="text-end">${r.counts.total}</td>
+          <td class="text-end">${r.counts.prod || ""}</td>
+          <td class="text-end">${r.counts.uat || ""}</td>
+          <td class="text-end ${r.counts.dr ? "text-info fw-semibold" : ""}">${r.counts.dr || ""}</td>
+          <td>${esc(r.tier)}</td>
+          <td><span class="badge bg-secondary">${esc(stratLabel(r.strategy))}</span></td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+
+  wrap.innerHTML = `${sqlFixItHtml}${orphanFixItHtml}${tableHtml}`;
+
+  // Update the App Audit accordion's header badge with a count of items needing
+  // attention (orphan/uat-only apps + SQL candidates) so the user knows whether
+  // it's worth opening the section.
+  const auditBadge = document.getElementById("drAppAuditBadge");
+  if (auditBadge) {
+    const issues = orphanApps.length + uatOnlyApps.length + sqlCandidates.length;
+    auditBadge.textContent = issues > 0
+      ? `${issues} need${issues === 1 ? "s" : ""} review`
+      : `${pairing.apps.length} apps · all paired`;
+    auditBadge.className = issues > 0
+      ? "badge bg-warning text-dark ms-2"
+      : "badge bg-success ms-2";
+  }
+
+  // Wire fix-it card listeners. Any change → recompute decisions object → POST.
+  wrap.querySelectorAll(".orphan-action, .orphan-strategy, .orphan-map").forEach(el => {
+    el.addEventListener("change", () => {
+      // When a radio changes, also reveal/hide its sub-row siblings.
+      if (el.classList.contains("orphan-action")) {
+        const card = el.closest("[data-orphan-app]");
+        if (card) {
+          card.querySelectorAll("[data-sub]").forEach(sub => {
+            sub.classList.toggle("hidden", sub.getAttribute("data-sub") !== el.value);
+          });
+        }
+      }
+      pushOrphanDecisions();
+    });
+  });
+  // SQL card listeners: any radio change → push SQL decisions
+  wrap.querySelectorAll(".sql-action").forEach(el => {
+    el.addEventListener("change", pushSqlDecisions);
+  });
+}
+
+// Collect every fix-it card's current state and POST it. Default = "lns".
+async function pushOrphanDecisions() {
+  if (!state.sessionId) return;
+  const wrap = document.getElementById("drAppTableWrap");
+  if (!wrap) return;
+  const decisions = {};
+  wrap.querySelectorAll("[data-orphan-app]").forEach(card => {
+    const app = card.getAttribute("data-orphan-app");
+    const action = card.querySelector(".orphan-action:checked")?.value || "lns";
+    const entry = { action };
+    if (action === "dr-strategy") entry.strategy = card.querySelector(".orphan-strategy")?.value || "std-asr";
+    if (action === "map") {
+      const m = card.querySelector(".orphan-map")?.value;
+      if (m) entry.mapToApp = m;
+      else return; // skip incomplete map decisions
+    }
+    decisions[app] = entry;
+  });
+  state.drStrategy = state.drStrategy || {};
+  state.drStrategy.orphanDecisions = decisions;
+  try {
+    const res = await fetch("/api/dr-strategy/orphan-decisions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(state.tokenId ? { "X-Token-Id": state.tokenId } : {}) },
+      body: JSON.stringify({ sessionId: state.sessionId, decisions }),
+    });
+    if (!res.ok) throw new Error(`orphan-decisions ${res.status}`);
+    const data = await res.json();
+    state.assessmentReport = data.combined;
+    // Re-run DR strategy to reflect new buckets (orphans pushed to L&S leave
+    // the DR pool; orphans forced to a strategy create new synthetic rows).
+    await recalcDrStrategy();
+    // Also refresh per-env summary cards + combined total.
+    if (state.environments) {
+      for (const env of state.environments) {
+        const r = data.combined.servers ? null : null;
+        // We don't have per-env reports back from this endpoint, but the
+        // combined refresh + recalcDrStrategy will reload Step 4's view.
+      }
+    }
+    // Rerender the by-app view itself so badges/totals reflect new state.
+    renderDrAppView();
+    // L&S server count may have shifted (orphans pushed to L&S or back to DR),
+    // so refresh egress which is per-server-driven.
+    calculateEgressCost();
+  } catch (e) { console.error("[Orphan decisions] failed:", e.message); }
+}
+
+// Collect every SQL fix-it card's current state and POST it. Default = "ag".
+async function pushSqlDecisions() {
+  if (!state.sessionId) return;
+  const wrap = document.getElementById("drAppTableWrap");
+  if (!wrap) return;
+  const decisions = {};
+  wrap.querySelectorAll("[data-sql-app]").forEach(card => {
+    const app = card.getAttribute("data-sql-app");
+    const action = card.querySelector(".sql-action:checked")?.value || "ag";
+    decisions[app] = { action };
+  });
+  state.drStrategy = state.drStrategy || {};
+  state.drStrategy.sqlDecisions = decisions;
+  try {
+    const res = await fetch("/api/dr-strategy/sql-decisions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(state.tokenId ? { "X-Token-Id": state.tokenId } : {}) },
+      body: JSON.stringify({ sessionId: state.sessionId, decisions }),
+    });
+    if (!res.ok) throw new Error(`sql-decisions ${res.status}`);
+    const data = await res.json();
+    state.assessmentReport = data.combined;
+    await recalcDrStrategy();
+    renderDrAppView();
+    // SQL decisions don't change L&S vs deferred totals (SQL DR rows are
+    // already in the deferred bucket), but recompute egress defensively to
+    // keep the calc-info note in sync.
+    calculateEgressCost();
+  } catch (e) { console.error("[SQL decisions] failed:", e.message); }
+}
+
+function escAttr(s) { return String(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 
 function updateStep5Totals() {
   const c = state.step5Costs;
@@ -1977,9 +3426,11 @@ document.getElementById("egressEnabled").addEventListener("change", calculateEgr
 document.getElementById("egressMethod").addEventListener("change", calculateEgressCost);
 document.getElementById("egressPerServer").addEventListener("input", calculateEgressCost);
 document.getElementById("egressTotalGB").addEventListener("input", calculateEgressCost);
-document.getElementById("backupRetention").addEventListener("change", calculateBackupCost);
-document.getElementById("backupRedundancy").addEventListener("change", calculateBackupCost);
+// Per-env retention/redundancy listeners are bound dynamically inside
+// buildBackupEnvPolicyTable. Only the global change-rate + compression remain
+// page-level wired listeners since those apply to the whole table.
 document.getElementById("backupChangeRate").addEventListener("input", calculateBackupCost);
+document.getElementById("backupCompression")?.addEventListener("input", calculateBackupCost);
 
 // LZ component listeners
 document.querySelectorAll(".lz-sku-select").forEach(sel => {
@@ -2184,22 +3635,51 @@ function populateBOM() {
   const asrServers = state.step5ASRInfo?.servers || 0;
   document.getElementById("bom_asr_info").textContent = asrServers > 0 ? `(${asrServers} servers)` : "";
 
-  // License calculation
-  let winCores = 0, sqlCores = 0;
+  // License core counts — BYOL conversation. Only count L&S servers; deferred
+  // and excluded rows aren't paying for Azure compute so they aren't licensed
+  // License core counts — BYOL conversation. Only count L&S servers; deferred
+  // and excluded rows aren't paying for Azure compute so they aren't licensed
+  // here either. SQL is a subset of Windows when SQL on Windows; we still tally
+  // it separately so pre-sales can quote SQL Server licences alongside Windows.
+  // Respect AHUB per env: when AHUB is off the licence is bundled into Azure
+  // compute (not BYOL), so those cores shouldn't appear on the BYOL line —
+  // matches the per-env table semantics.
+  let winCores = 0, sqlCores = 0, linuxCores = 0;
   for (const srv of report.servers) {
-    const isWindows = srv.isWindows || (srv.osName || "").toLowerCase().includes("windows");
-    if (isWindows) winCores += (srv.vmCores || 0);
-    const nameLC = (srv.serverName || "").toLowerCase();
+    if (srv.costExcluded || srv.costDeferredToDr) continue;
     const osLC = (srv.osName || "").toLowerCase();
-    if (nameLC.includes("sql") || osLC.includes("sql")) sqlCores += (srv.vmCores || 0);
+    const nameLC = (srv.serverName || "").toLowerCase();
+    const isWindows = srv.isWindows || /windows|win2008|win2003|win2012|win2016|win2019|win2022/.test(osLC);
+    const isLinux = /linux|red\s*hat|rhel|centos|ubuntu|debian|suse|oracle\s*linux|amazon\s*linux/.test(osLC);
+    const cores = Number(srv.vmCores) || 0;
+    const envCfg = state.envConfigs?.[srv.environment] || {};
+    const ahubOnForEnv = envCfg.useAhub !== false;
+    if (isWindows && ahubOnForEnv) winCores += cores;
+    else if (isLinux) linuxCores += cores;
+    // SQL cores: same AHUB-respect — if Windows and AHUB-off, SQL licence is
+    // also bundled, so don't count it as BYOL. SQL on Linux (always BYOL) still
+    // counts.
+    if ((nameLC.includes("sql") || osLC.includes("sql")) && (!isWindows || ahubOnForEnv)) sqlCores += cores;
   }
   document.getElementById("bom_winCores").textContent = winCores;
   document.getElementById("bom_sqlCores").textContent = sqlCores;
+  // The Linux row has no dedicated cores span in the HTML; inject one so the
+  // operator can see Azure cores beside the BYOL/RHEL Cloud Access price field.
+  const linuxRow = document.getElementById("bom_linuxlicense")?.closest("tr");
+  const linuxLabel = linuxRow?.querySelector(".bom-sub-item");
+  if (linuxLabel) linuxLabel.innerHTML = `Linux &mdash; Total Cores: <span id="bom_linuxCores">${linuxCores}</span>`;
+  state.bomLicenseCores = { winCores, sqlCores, linuxCores };
   if (isFirstRender) {
-    document.getElementById("bom_winlicense").value = (0).toFixed(2);
-    document.getElementById("bom_sqllicense").value = (0).toFixed(2);
-    document.getElementById("bom_linuxlicense").value = (0).toFixed(2);
-    document.getElementById("bom_otherdb").value = (0).toFixed(2);
+    // Leave inputs blank so pre-sales fills in the BYOL/SA rate. A literal 0.00
+    // misleads procurement into thinking the licence cost is genuinely zero.
+    document.getElementById("bom_winlicense").value = "";
+    document.getElementById("bom_sqllicense").value = "";
+    document.getElementById("bom_linuxlicense").value = "";
+    document.getElementById("bom_otherdb").value = "";
+    document.getElementById("bom_winlicense").placeholder = "BYOL/SA rate $/mo";
+    document.getElementById("bom_sqllicense").placeholder = "BYOL/SA rate $/mo";
+    document.getElementById("bom_linuxlicense").placeholder = "RHEL/SUSE plan $/mo";
+    document.getElementById("bom_otherdb").placeholder = "$/mo";
     state.bomPopulated = true;
   }
 
@@ -2271,18 +3751,30 @@ document.getElementById("downloadBOMExcel").addEventListener("click", async () =
     ["Azure Monitor", "bom_monitor_val"],
   ];
   for (const [label, id] of lzItems) {
-    bomItems.push({ label: "  " + label, value: parseFloat(document.getElementById(id)?.textContent) || 0 });
+    // Strip thousands separators before parseFloat \u2014 fmtCost emits "12,345.67"
+    // and parseFloat would otherwise truncate at the comma to 12.
+    const raw = (document.getElementById(id)?.textContent || "0").replace(/,/g, "");
+    bomItems.push({ label: "  " + label, value: parseFloat(raw) || 0 });
   }
   bomItems.push({ label: "", value: "" });
-  bomItems.push({ label: "Network Egress", value: parseFloat(document.getElementById("bom_egress_val")?.textContent) || 0 });
-  bomItems.push({ label: "Azure Backup", value: parseFloat(document.getElementById("bom_backup_val")?.textContent) || 0 });
-  bomItems.push({ label: "Azure Site Recovery", value: parseFloat(document.getElementById("bom_asr_val")?.textContent) || 0 });
+  // Step 5 numeric values — read from state.step5Costs (numbers), NOT from
+  // textContent which is comma-formatted ("54,123.45") and would parseFloat
+  // back to 54. Bug previously surfaced as Backup=$54 / ASR=$42 in the export.
+  bomItems.push({ label: "Network Egress", value: Number(state.step5Costs?.egress) || 0 });
+  bomItems.push({ label: "Azure Backup", value: Number(state.step5Costs?.backup) || 0 });
+  bomItems.push({ label: "Azure Site Recovery", value: Number(state.step5Costs?.asr) || 0 });
   bomItems.push({ label: "", value: "" });
-  bomItems.push({ label: "Licensing", value: "" });
-  bomItems.push({ label: "  Windows License", value: parseFloat(document.getElementById("bom_winlicense")?.value) || 0 });
-  bomItems.push({ label: "  SQL License", value: parseFloat(document.getElementById("bom_sqllicense")?.value) || 0 });
-  bomItems.push({ label: "  Linux", value: parseFloat(document.getElementById("bom_linuxlicense")?.value) || 0 });
-  bomItems.push({ label: "  Other Databases", value: parseFloat(document.getElementById("bom_otherdb")?.value) || 0 });
+  bomItems.push({ label: "Licensing (cores shown for BYOL / SA quoting; rate filled by pre-sales)", value: "" });
+  // Use NaN sentinel for blank rates so the export can render "" instead of 0.
+  const winRate = parseFloat(document.getElementById("bom_winlicense")?.value);
+  const sqlRate = parseFloat(document.getElementById("bom_sqllicense")?.value);
+  const linuxRate = parseFloat(document.getElementById("bom_linuxlicense")?.value);
+  const otherRate = parseFloat(document.getElementById("bom_otherdb")?.value);
+  const cores = state.bomLicenseCores || { winCores: 0, sqlCores: 0, linuxCores: 0 };
+  bomItems.push({ label: "  Windows License", cores: cores.winCores, value: Number.isFinite(winRate) ? winRate : "" });
+  bomItems.push({ label: "  SQL License", cores: cores.sqlCores, value: Number.isFinite(sqlRate) ? sqlRate : "" });
+  bomItems.push({ label: "  Linux", cores: cores.linuxCores, value: Number.isFinite(linuxRate) ? linuxRate : "" });
+  bomItems.push({ label: "  Other Databases", value: Number.isFinite(otherRate) ? otherRate : "" });
   bomItems.push({ label: "", value: "" });
   bomItems.push({ label: "Total Monthly Cost", value: document.getElementById("bom_totalMonthly")?.textContent || "" });
   bomItems.push({ label: "Total Annual Cost", value: document.getElementById("bom_totalAnnual")?.textContent || "" });
@@ -2292,11 +3784,69 @@ document.getElementById("downloadBOMExcel").addEventListener("click", async () =
     envReportsInfo[env] = { totalServers: state.envReports?.[env]?.summary?.totalServers || state.envCounts?.[env] || 0 };
   }
 
+  // Snapshot the Step 5 configuration so the BOM XLSX can render dedicated
+  // LZ + Backup sheets. Server-side state.drStrategy is already on the session.
+  const step5Snapshot = {
+    egress: {
+      enabled: document.getElementById("egressEnabled")?.checked,
+      method: document.getElementById("egressMethod")?.value,
+      perServer: parseFloat(document.getElementById("egressPerServer")?.value) || 0,
+      totalGB: parseFloat(document.getElementById("egressTotalGB")?.value) || 0,
+      monthlyCost: state.step5Costs.egress,
+    },
+    landingZone: ["firewall", "vpn", "er", "bastion", "monitor"].map(c => {
+      const skuSelect = document.getElementById(`lz_${c}_sku`);
+      const qty = parseInt(document.getElementById(`lz_${c}_qty`)?.value) || 0;
+      const unitCost = parseFloat(skuSelect?.value) || 0;
+      const enabled = document.getElementById(`lz_${c}_on`)?.checked;
+      const skuName = skuSelect?.selectedOptions?.[0]?.dataset?.skuName || "";
+      return {
+        component: c,
+        enabled: !!enabled,
+        sku: skuName,
+        qty,
+        unitMonthlyCost: unitCost,
+        monthlyCost: enabled ? unitCost * qty : 0,
+      };
+    }),
+    backup: {
+      changeRate: parseFloat(document.getElementById("backupChangeRate")?.value) || 0,
+      compression: parseFloat(document.getElementById("backupCompression")?.value) || 0,
+      perEnvPolicies: state.backupPolicies || {},
+      perEnvBreakdown: state.step5BackupInfo?.perEnv || [],
+      monthlyCost: state.step5Costs.backup,
+    },
+    drStrategy: { monthlyCost: state.step5Costs.asr },
+    grandTotal: state.step5Costs.egress + state.step5Costs.lz + state.step5Costs.backup + state.step5Costs.asr,
+  };
+
   try {
+    // Per-server backup is computed only in the browser by calculateBackupCost(),
+    // so the server's session.assessmentReport.servers[].backupMonthlyCost is 0.
+    // Ship a name->cost map alongside the export so the server can stamp it onto
+    // the per-server BOM rows. Includes ALL servers (L&S, deferred, excluded)
+    // because backup is per-env-policy, not per-cost-treatment.
+    const perServerBackup = {};
+    for (const srv of (state.assessmentReport?.servers || [])) {
+      if (!srv?.serverName) continue;
+      const v = Number(srv.backupMonthlyCost);
+      if (Number.isFinite(v) && v > 0) perServerBackup[srv.serverName] = v;
+    }
+    for (const env of (state.environments || [])) {
+      const r = state.envReports?.[env];
+      for (const srv of (r?.servers || [])) {
+        if (!srv?.serverName) continue;
+        const v = Number(srv.backupMonthlyCost);
+        if (Number.isFinite(v) && v > 0 && !perServerBackup[srv.serverName]) {
+          perServerBackup[srv.serverName] = v;
+        }
+      }
+    }
     const resp = await fetch("/api/export/bom-xlsx", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        sessionId: state.sessionId,
         customerName,
         region,
         environments: state.environments || ["All"],
@@ -2304,6 +3854,8 @@ document.getElementById("downloadBOMExcel").addEventListener("click", async () =
         envReports: envReportsInfo,
         envCounts: state.envCounts,
         bomItems,
+        step5Snapshot,
+        perServerBackup,
       }),
     });
     if (!resp.ok) { alert("Export failed: " + (await resp.text())); return; }
@@ -2322,6 +3874,7 @@ document.getElementById("backToStep6").addEventListener("click", () => goToStep(
 
 let wavePlanData = null;
 let wavePlanGroupingModes = [];
+let wavePlanTotalServers = 0; // L&S-only count from detect-groups (excludes DR-deferred & excluded). summary.totalServers in state.assessmentReport still counts DR-deferred rows, so do not use that here.
 let lastUserInstructions = "";
 
 // Determine which tag keys the user actually referenced in their instructions.
@@ -2408,7 +3961,8 @@ function initWavePlan() {
       }
 
       // Show pilot guidance
-      showPilotGuidance(data.totalServers, wavePlanGroupingModes);
+      wavePlanTotalServers = data.totalServers || 0;
+      showPilotGuidance(wavePlanTotalServers, wavePlanGroupingModes);
     })
     .catch(err => wpShowStatus("Failed to detect grouping: " + err.message, "error"));
 }
@@ -2487,8 +4041,7 @@ function updateCapacityGuidance(totalServers) {
 // Recalculate guidance when any input changes
 ["wpPilotDuration", "wpPilotThroughput", "wpNumWaves", "wpWaveDuration", "wpWaveThroughput"].forEach(id => {
   document.getElementById(id).addEventListener("input", () => {
-    const totalServers = state.assessmentReport?.summary?.totalServers || 0;
-    if (totalServers) updateCapacityGuidance(totalServers);
+    if (wavePlanTotalServers) updateCapacityGuidance(wavePlanTotalServers);
   });
 });
 
@@ -2554,10 +4107,57 @@ document.getElementById("wpGenerateBtn").addEventListener("click", async () => {
   }
 });
 
+// Patch a freshly-returned wave plan with backup attribution from local state.
+// The server doesn't know per-server backup cost (calculated only by the BOM
+// page), so its wave.waveBackup is always 0 and wave.waveCost excludes backup.
+// Build a name->backup map and re-stamp wave totals + cumulative chain.
+function patchWaveBackupCosts(plan) {
+  if (!plan || !Array.isArray(plan.waves)) return;
+  const backupByName = new Map();
+  const collect = (srv) => {
+    if (!srv || !srv.serverName) return;
+    const v = Number(srv.backupMonthlyCost) || 0;
+    // Pick the larger value if the same name appears in multiple report copies
+    // (combined report + per-env reports) so DR-deferred 0s don't override a
+    // real value stamped on the L&S row.
+    const prev = backupByName.get(srv.serverName) || 0;
+    if (v > prev) backupByName.set(srv.serverName, v);
+  };
+  for (const srv of (state.assessmentReport?.servers || [])) collect(srv);
+  for (const env of (state.environments || [])) {
+    const r = state.envReports?.[env];
+    for (const srv of (r?.servers || [])) collect(srv);
+  }
+  if (backupByName.size === 0) return; // nothing to patch (BOM step not run yet)
+
+  let cum = 0;
+  for (const wave of plan.waves) {
+    let waveBackup = 0;
+    for (const g of (wave.groups || [])) {
+      for (const name of (g.servers || [])) waveBackup += backupByName.get(name) || 0;
+    }
+    waveBackup = Math.round(waveBackup * 100) / 100;
+    const priorBackup = Number(wave.waveBackup) || 0;
+    const baseCost = (Number(wave.waveCost) || 0) - priorBackup; // strip any zero or stale backup
+    const newWaveCost = Math.round((baseCost + waveBackup) * 100) / 100;
+    wave.waveBackup = waveBackup;
+    wave.waveCost = newWaveCost;
+    cum = Math.round((cum + newWaveCost) * 100) / 100;
+    wave.cumulativeCost = cum;
+  }
+}
+
 // Render Wave Plan
 function renderWavePlan(plan) {
   document.getElementById("wpTimeline").classList.remove("hidden");
   document.getElementById("wpExportBtns").classList.remove("hidden");
+
+  // Backup costs are computed client-side in calculateBackupCost() and never
+  // reach the server's session.assessmentReport, so wave.waveBackup / waveCost
+  // come back without backup attribution. Patch them here from local state so
+  // the UI (and any subsequent export that reads wavePlanData) shows real
+  // backup numbers.
+  patchWaveBackupCosts(plan);
 
   // Show capacity warning if returned by server
   if (plan.capacityWarning) {
@@ -2595,8 +4195,10 @@ function renderWavePlan(plan) {
       <td class="small">${fmtDateDisplay(wave.endDate)}</td>
       <td class="small text-truncate" style="max-width:200px" title="${escHtml(scopeText)}">${escHtml(scopeText) || '<span class="text-muted">—</span>'}</td>
       <td class="small text-truncate" style="max-width:150px" title="${escHtml(tagsText)}">${tagsText ? `<span class="text-info">${escHtml(tagsText)}</span>` : '<span class="text-muted">—</span>'}</td>
+      <td class="p-1"><textarea class="form-control form-control-sm wp-strategic-intent" data-wave="${wave.waveNumber}" rows="3" placeholder="Strategic intent &amp; validation gates" style="font-size:0.78rem; min-height:60px;">${escHtml(wave.strategicIntent || "")}</textarea></td>
       <td class="text-center">${wave.totalServers}${capacityLabel ? `<span class="text-muted small">${capacityLabel}</span>` : ""}</td>
       <td class="text-end">$${wave.waveCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+      <td class="text-end small text-muted">$${(wave.waveBackup || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
       <td class="text-end fw-bold">$${wave.cumulativeCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
     `;
     if (wave.waveNumber === 0) tr.classList.add("table-info");
@@ -2604,9 +4206,47 @@ function renderWavePlan(plan) {
     tbody.appendChild(tr);
   }
 
+  // Wire up the editable Strategic Intent cells. Persists on blur — debounced
+  // saves on every keystroke would generate dozens of session-disk writes for
+  // a long paragraph; blur is the natural commit point.
+  attachStrategicIntentListeners(plan);
+
   renderGantt(plan);
   renderWaveDetails(plan);
   checkBOMMatch(plan);
+}
+
+// Persists per-wave Strategic Intent edits to the backend. Updates the
+// in-memory plan object on success so a subsequent regen sees the latest text.
+async function saveStrategicIntent(plan, waveNumber, text) {
+  try {
+    const res = await fetch("/api/waveplan/update-meta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.sessionId, waveNumber, strategicIntent: text }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      console.warn("Failed to save Strategic Intent:", err.error || res.statusText);
+      return;
+    }
+    // Update local plan record so /update or /generate sees the new text.
+    const wave = plan.waves.find(w => w.waveNumber === waveNumber);
+    if (wave) wave.strategicIntent = text;
+  } catch (e) {
+    console.warn("Strategic Intent save error:", e);
+  }
+}
+
+function attachStrategicIntentListeners(plan) {
+  const tbody = document.getElementById("wpTimelineBody");
+  if (!tbody) return;
+  tbody.querySelectorAll("textarea.wp-strategic-intent").forEach(ta => {
+    ta.addEventListener("blur", () => {
+      const waveNumber = parseInt(ta.dataset.wave, 10);
+      saveStrategicIntent(plan, waveNumber, ta.value);
+    });
+  });
 }
 
 // Gantt bar chart

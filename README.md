@@ -210,7 +210,7 @@ If you paste the full endpoint URL (e.g., `https://x.openai.azure.com/openai/dep
 
 ---
 
-## 💰 BOM Cost Categories
+## 💰 BOM Cost Categoriesnp
 
 | Category | Source | Sharing Model |
 |----------|--------|---------------|
@@ -371,7 +371,22 @@ Contributions are welcome! Here's how:
 
 ## 📄 License
 
-This project is open source. See [LICENSE](LICENSE) for details.
+This project is **source-available for non-commercial use only** under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0). See [LICENSE](LICENSE) for the full terms.
+
+**Permitted uses (no fee, no permission needed):**
+
+- Personal study, research, experimentation
+- Use by charitable organizations, educational institutions, public research organizations, government institutions, and other non-commercial bodies
+- Hobby projects and amateur pursuits
+- Modifying the code and distributing changes for any non-commercial purpose
+
+**Not permitted without a separate commercial licence:**
+
+- Selling the software, or any product or service that bundles or depends on it
+- Using the software internally inside a for-profit company for revenue-generating activities
+- Hosting the software as part of a paid offering (SaaS, managed service, consulting deliverable, etc.)
+
+If you want to use Dr. BOM Agent commercially, please open an issue on GitHub to discuss licensing.
 
 ---
 

@@ -360,11 +360,20 @@
           <label for="globalSizingMode" class="form-label small fw-semibold mb-0 me-1">
             <i class="bi bi-rulers text-primary"></i> Sizing Mode:
           </label>
-          <select id="globalSizingMode" class="form-select form-select-sm" style="max-width:260px;">
+          <select id="globalSizingMode" class="form-select form-select-sm" style="max-width:280px;">
             <option value="auto" selected>Auto (Recommended)</option>
             <option value="as-allocated">As-Allocated Only</option>
             <option value="performance-based">Performance-Based Only</option>
+            <option value="industry-optimized">Industry-Optimized (no perf data)</option>
           </select>
+          <!-- Industry-optimisation factors. Only visible when mode = industry-optimized.
+               Editable inputs so consultants can tune for the customer's workload mix. -->
+          <span id="industryOptInputs" class="d-inline-flex align-items-center gap-1 hidden">
+            <span class="small text-muted ms-1">CPU ×</span>
+            <input type="number" id="cpuOptFactor" class="form-control form-control-sm" value="0.70" min="0.30" max="1.00" step="0.05" style="width:80px;" title="CPU optimisation factor (0.30–1.00). 0.70 = 30% reduction. Default reflects Gartner/Microsoft FastTrack guidance.">
+            <span class="small text-muted ms-2">RAM ×</span>
+            <input type="number" id="ramOptFactor" class="form-control form-control-sm" value="0.80" min="0.30" max="1.00" step="0.05" style="width:80px;" title="RAM optimisation factor (0.30–1.00). 0.80 = 20% reduction. RAM is harder to compress than CPU so default is more conservative.">
+          </span>
           <span class="text-muted small ms-1" id="sizingModeHelp" data-bs-toggle="tooltip" title="">
             <i class="bi bi-info-circle"></i>
             <span id="sizingModeHelpText">Auto picks the safest method per server based on telemetry availability.</span>
@@ -410,6 +419,9 @@
           <div class="total-item"><div class="total-value" id="combinedSecurity">USD 0</div><div class="total-label">Combined Security/mo</div></div>
           <div class="total-item"><div class="total-value" id="combinedTotal">USD 0</div><div class="total-label">TOTAL Monthly</div></div>
         </div>
+
+        <!-- Sizing Optimisation Summary (inventory vs Azure recommended) -->
+        <div id="sizingOptimisationSummary" class="hidden mt-3"></div>
 
         <!-- Sizing Summary Banner (Step 3) -->
         <div id="sizingSummaryBannerStep3" class="mt-3"></div>
@@ -569,47 +581,92 @@
                 <strong class="small">Azure Backup</strong>
                 <span class="badge bg-success" id="backupCostBadge">USD 0.00/mo</span>
               </div>
+              <div class="alert alert-info py-2 px-2 small mb-2">
+                <i class="bi bi-info-circle me-1"></i>
+                Pick which environments to back up and assign each one its own <strong>retention</strong> and <strong>redundancy</strong>.
+                Banking customers typically use 1-year + GRS for Production (regulatory) and 30-day LRS for non-prod (operational only).
+                Differentiated policies typically save 30-50% vs applying Production rules estate-wide.
+              </div>
+              <!-- Per-env policy table populated by JS. When the inventory has only one env
+                   ('All' or no env detected) the table renders a single row. -->
+              <div id="backupEnvPolicies" class="mb-2"></div>
               <div class="row g-2 mb-2">
-                <div class="col-md-4">
-                  <label class="form-label small mb-0">Environments to Backup:</label>
-                  <div id="backupEnvCheckboxes" class="d-flex flex-wrap gap-1 mt-1"></div>
-                </div>
                 <div class="col-md-3">
-                  <label class="form-label small mb-0">Retention:</label>
-                  <select class="form-select form-select-sm" id="backupRetention">
-                    <option value="30_days" selected>30 days (1.5×)</option>
-                    <option value="90_days">90 days (2×)</option>
-                    <option value="1_year">1 year (3×)</option>
-                  </select>
-                </div>
-                <div class="col-md-2">
-                  <label class="form-label small mb-0">Redundancy:</label>
-                  <select class="form-select form-select-sm" id="backupRedundancy">
-                    <option value="lrs" selected>LRS</option>
-                    <option value="grs">GRS</option>
-                  </select>
-                </div>
-                <div class="col-md-3">
-                  <label class="form-label small mb-0">Daily Change Rate %:</label>
+                  <label class="form-label small mb-0" title="Used for incremental backup sizing. Higher daily churn = bigger backups for the same retention.">
+                    Daily Change Rate %:
+                  </label>
                   <input type="number" class="form-control form-control-sm" id="backupChangeRate" value="3" min="1" max="50">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label small mb-0" title="Azure Backup applies compression and (where applicable) dedup. Industry-typical effective storage saving is 40-60%. Increase if customer expects high dedup (VDI / templated VMs), decrease for already-compressed workloads (encrypted DBs, media).">
+                    Compression &amp; Dedup %:
+                  </label>
+                  <input type="number" class="form-control form-control-sm" id="backupCompression" value="50" min="0" max="90" step="5">
                 </div>
               </div>
               <div class="text-muted small" id="backupCalcInfo">Calculating...</div>
             </div>
 
-            <!-- ASR -->
-            <div class="border rounded p-3 bg-white">
+            <!-- DR Strategy (replaces flat ASR) -->
+            <div class="border rounded p-3 bg-white" id="drStrategyCard">
               <div class="d-flex justify-content-between align-items-center mb-2">
-                <strong class="small">Azure Site Recovery (ASR)</strong>
-                <span class="badge bg-success" id="asrCostBadge">USD 0.00/mo</span>
+                <strong class="small">Disaster Recovery Strategy</strong>
+                <span class="badge bg-success" id="drStrategyCostBadge">USD 0.00/mo</span>
               </div>
-              <div class="row g-2">
-                <div class="col-md-6">
-                  <label class="form-label small mb-0">Environments for DR:</label>
-                  <div id="asrEnvCheckboxes" class="d-flex flex-wrap gap-1 mt-1"></div>
+              <div class="alert alert-info py-2 px-3 small mb-2">
+                <i class="bi bi-info-circle me-1"></i>
+                Step 3 sized your <strong>primary</strong> compute. This section adds the cost of <strong>protecting</strong> it against region failure, by criticality.
+                Pick the column in your inventory that expresses tier/criticality, then assign each tier the right Azure DR pattern.
+              </div>
+              <div class="row g-2 mb-2">
+                <div class="col-md-7">
+                  <label class="form-label small mb-0">Criticality column:</label>
+                  <select class="form-select form-select-sm" id="drCriticalityColumn">
+                    <option value="">— Detect from inventory —</option>
+                  </select>
+                  <div class="form-text" style="font-size:0.7rem;" id="drCriticalityColumnHint"></div>
                 </div>
-                <div class="col-md-6">
-                  <div class="text-muted small" id="asrCalcInfo">Select environments to protect with ASR.</div>
+                <div class="col-md-5">
+                  <label class="form-label small mb-0">ASR licence ($/server/mo):</label>
+                  <input type="number" class="form-control form-control-sm" id="drAsrPrice" value="25" step="0.01" min="0">
+                </div>
+              </div>
+              <!-- Scope tabs: pick which servers the DR Strategy is applied to.
+                   "Deferred Servers" = whatever was marked dr-defer in VM Assess (recommended).
+                   "Whole Estate"     = every non-excluded server (what-if scenario). -->
+              <ul class="nav nav-tabs nav-fill small mb-0 mt-2" id="drScopeTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                  <button class="nav-link active py-1 px-2" id="drScopeDeferredTab" data-scope="deferred" type="button">
+                    <i class="bi bi-shield-check"></i> Deferred Servers
+                    <span class="badge bg-info ms-1" id="drScopeDeferredCount">—</span>
+                  </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                  <button class="nav-link py-1 px-2" id="drScopeWholeTab" data-scope="whole-estate" type="button">
+                    <i class="bi bi-globe"></i> Whole Estate
+                    <span class="badge bg-secondary ms-1" id="drScopeWholeCount">—</span>
+                  </button>
+                </li>
+              </ul>
+              <div class="border border-top-0 rounded-bottom p-2">
+                <div id="drTierTableWrap"></div>
+                <div id="drStrategyCalcInfo" class="text-muted small mt-1"></div>
+              </div>
+              <!-- Application audit (orphans, SQL replicas, paired apps) — always
+                   visible regardless of scope. Collapsible to keep the matrix prominent. -->
+              <div class="accordion accordion-flush mt-2" id="drAppAuditAcc">
+                <div class="accordion-item border rounded">
+                  <h2 class="accordion-header">
+                    <button class="accordion-button collapsed py-2 small" type="button" data-bs-toggle="collapse" data-bs-target="#drAppAuditBody">
+                      <i class="bi bi-clipboard-check me-1"></i> Application Audit &amp; Reconciliation
+                      <span class="badge bg-light text-dark border ms-2" id="drAppAuditBadge">—</span>
+                    </button>
+                  </h2>
+                  <div id="drAppAuditBody" class="accordion-collapse collapse">
+                    <div class="accordion-body py-2">
+                      <div id="drAppTableWrap"></div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -621,11 +678,12 @@
           <div class="total-item"><div class="total-value" id="step5EgressTotal">USD 0</div><div class="total-label">Egress</div></div>
           <div class="total-item"><div class="total-value" id="step5LZTotal">USD 0</div><div class="total-label">Landing Zone</div></div>
           <div class="total-item"><div class="total-value" id="step5BackupTotal">USD 0</div><div class="total-label">Backup</div></div>
-          <div class="total-item"><div class="total-value" id="step5ASRTotal">USD 0</div><div class="total-label">Site Recovery</div></div>
+          <div class="total-item"><div class="total-value" id="step5ASRTotal">USD 0</div><div class="total-label">DR Strategy</div></div>
           <div class="total-item"><div class="total-value" id="step5GrandTotal">USD 0</div><div class="total-label">STEP 5 TOTAL</div></div>
         </div>
 
-        <!-- Architecture Diagram (draw.io export) -->
+        <!-- Architecture Diagram (draw.io export) — TEMPORARILY HIDDEN
+             while we focus on calculation accuracy. Uncomment to restore.
         <div class="card bg-light mb-3 mt-3">
           <div class="card-body p-3">
             <h6 class="fw-semibold mb-2"><i class="bi bi-diagram-3"></i> Architecture Diagram (Prototype)</h6>
@@ -659,6 +717,7 @@
             </div>
           </div>
         </div>
+        -->
 
         <div class="d-flex justify-content-between mt-4 pt-3 border-top">
           <button class="btn btn-outline-secondary btn-sm" id="backToStep4"><i class="bi bi-arrow-left"></i> Back</button>
@@ -701,7 +760,7 @@
 
               <tr class="bom-section-header"><td colspan="2"><strong>BCDR</strong></td></tr>
               <tr><td class="bom-sub-item">Azure Backup <span class="text-muted small" id="bom_backup_info"></span></td><td class="text-end"><span id="bom_backup_val" class="bom-readonly">0.00</span></td></tr>
-              <tr><td class="bom-sub-item">Azure Site Recovery <span class="text-muted small" id="bom_asr_info"></span></td><td class="text-end"><span id="bom_asr_val" class="bom-readonly">0.00</span></td></tr>
+              <tr><td class="bom-sub-item">DR Strategy <span class="text-muted small" id="bom_asr_info"></span></td><td class="text-end"><span id="bom_asr_val" class="bom-readonly">0.00</span></td></tr>
 
               <tr class="bom-section-header"><td colspan="2"><strong>License</strong></td></tr>
               <tr><td class="bom-sub-item">Windows License &mdash; Total Cores: <span id="bom_winCores">0</span></td><td><input type="number" step="0.01" id="bom_winlicense" class="form-control form-control-sm bom-input"></td></tr>
@@ -851,9 +910,11 @@
                   <th style="width:100px">End</th>
                   <th>Scope</th>
                   <th style="width:150px">AI Insight</th>
+                  <th style="width:230px" title="Editable. Paste the customer's strategic intent / validation gates for this wave. Saved per session, included in the wave plan XLSX export.">Strategic Intent (editable)</th>
                   <th style="width:60px">VMs</th>
-                  <th style="width:110px">Wave Cost/mo</th>
-                  <th style="width:130px">Cumulative/mo</th>
+                  <th style="width:110px" title="Wave incremental run-rate added on completion (compute + storage + Defender + backup).">Wave Cost/mo</th>
+                  <th style="width:100px" title="Backup portion of the wave cost (already included in Wave Cost; shown for transparency).">Backup/mo</th>
+                  <th style="width:130px" title="Cumulative monthly run-rate after this wave completes.">Cumulative/mo</th>
                 </tr>
               </thead>
               <tbody id="wpTimelineBody"></tbody>

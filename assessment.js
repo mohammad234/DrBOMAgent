@@ -38,10 +38,25 @@ function parseUtilization(raw) {
   return v;
 }
 
-// `modeOverride` (optional): "as-allocated" | "performance-based" | "auto" — when
-// supplied, takes precedence over sizingConfig.rightSizing.mode. This is how the UI's
-// global "Sizing Mode" override flows in without mutating shared config.
-function computeRequiredResources(server, cores, memoryMB, modeOverride) {
+// Numeric clamp helper used by sizing-mode factor handling.
+function clamp(n, lo, hi) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return lo;
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// `modeOverride` (optional): "as-allocated" | "performance-based" | "auto"
+// | "industry-optimized" — when supplied, takes precedence over
+// sizingConfig.rightSizing.mode. This is how the UI's global "Sizing Mode"
+// override flows in without mutating shared config.
+//
+// `factors` (optional): { cpuOptimisationFactor, ramOptimisationFactor }
+// Used ONLY when mode === "industry-optimized". When omitted, falls back to
+// the config defaults (0.70 / 0.80). Values are clamped to [0.30, 1.00] to
+// stay safe — going below 0.3 would risk producing unusably small VMs.
+function computeRequiredResources(server, cores, memoryMB, modeOverride, factors) {
   const rs = sizingConfig.rightSizing || {};
   const mode = modeOverride || rs.mode || "as-allocated";
   const asAlloc = rs.asAllocated || { cpuComfortFactor: 1.0, ramComfortFactor: 1.0 };
@@ -58,6 +73,27 @@ function computeRequiredResources(server, cores, memoryMB, modeOverride) {
       reqMemMB: Math.ceil(memoryMB * asAlloc.ramComfortFactor),
       sizingMode: "as-allocated",
       sizingReason: "Mode=as-allocated (no telemetry sizing).",
+      cpuUtilUsed: null,
+      memUtilUsed: null,
+    };
+  }
+
+  // Industry-optimised path — no telemetry needed. Applies a conservative
+  // downsize factor to combat typical on-prem over-allocation. Floors at
+  // configured minimums so we never produce sub-2vCPU / sub-4GB VMs.
+  if (mode === "industry-optimized") {
+    const io = rs.industryOptimized || {};
+    const minCores = sizingConfig.compute?.minimums?.vCPUs || 2;
+    const minMemMB = (sizingConfig.compute?.minimums?.memoryGB || 4) * 1024;
+    const cpuF = clamp(factors?.cpuOptimisationFactor ?? io.cpuFactor ?? 0.70, 0.30, 1.00);
+    const ramF = clamp(factors?.ramOptimisationFactor ?? io.ramFactor ?? 0.80, 0.30, 1.00);
+    const reqCores = Math.max(minCores, Math.ceil(cores * cpuF));
+    const reqMemMB = Math.max(minMemMB, Math.ceil(memoryMB * ramF));
+    return {
+      reqCores,
+      reqMemMB,
+      sizingMode: "industry-optimized",
+      sizingReason: `Industry-optimised: CPU × ${cpuF} → ${reqCores} cores · RAM × ${ramF} → ${Math.round(reqMemMB / 1024)} GB (floored at ${minCores}c / ${minMemMB / 1024}GB)`,
       cpuUtilUsed: null,
       memUtilUsed: null,
     };
@@ -358,9 +394,12 @@ function firstPassDiskMatch(diskSizeGB, diskTypeOverride) {
 }
 
 // ============ RUN FIRST-PASS MATCHING ============
-// `sizingModeOverride` (optional): "as-allocated" | "performance-based" | "auto" —
-// global override from the UI. When undefined, sizingConfig.rightSizing.mode is used.
-function runFirstPassMatching(servers, vmSizes, enabledSeries, cpuArchitecture, storageTier, sizingModeOverride) {
+// `sizingModeOverride` (optional): "as-allocated" | "performance-based" | "auto"
+// | "industry-optimized" — global override from the UI. When undefined,
+// sizingConfig.rightSizing.mode is used.
+// `optimisationFactors` (optional): { cpuOptimisationFactor, ramOptimisationFactor }
+// applied only when mode === "industry-optimized". Defaults from config when omitted.
+function runFirstPassMatching(servers, vmSizes, enabledSeries, cpuArchitecture, storageTier, sizingModeOverride, optimisationFactors) {
   const series = enabledSeries || (sizingConfig.vmSeriesPreference || [])
     .filter(s => s.defaultEnabled).map(s => s.id);
   const arch = cpuArchitecture || sizingConfig.cpuArchitecture?.default || "auto";
@@ -371,7 +410,7 @@ function runFirstPassMatching(servers, vmSizes, enabledSeries, cpuArchitecture, 
   return servers.map(server => {
     const cores = parseInt(server["*Cores"]) || minCores;
     const memoryMB = parseInt(server["*Memory (In MB)"]) || (minMemGB * 1024);
-    const sized = computeRequiredResources(server, cores, memoryMB, sizingModeOverride);
+    const sized = computeRequiredResources(server, cores, memoryMB, sizingModeOverride, optimisationFactors);
     const vmMatch = firstPassVmMatch(server, vmSizes, series, arch, sized);
 
     const diskMatches = [];
@@ -759,19 +798,60 @@ function rematchVmWithPricing(server, vmSizes, vmPricing, enabledSeries, exclude
 
 // ============ GENERATE REPORT (with security cost + rematch logic) ============
 function generateAssessmentReport(matchedServers, vmPricing, diskPricing, options) {
-  const { assessmentName, region, pricingModel, useAhub, vmSizes, enabledSeries, cpuArchitecture, securityEnabled: secOverride, securityPerServerPrice, sizingModeOverride } = options;
+  const { assessmentName, region, pricingModel, useAhub, vmSizes, enabledSeries, cpuArchitecture, securityEnabled: secOverride, securityPerServerPrice, sizingModeOverride, paygHoursPerMonth, costMode, cpuOptimisationFactor, ramOptimisationFactor } = options;
   const pricingModels = sizingConfig.pricingModels;
   const pricingDef = pricingModels.find(p => p.id === pricingModel) || pricingModels[2];
   const isRI = pricingModel !== "payg"; // 1yr or 3yr RI
+  // Industry-optimised factors pass through to rematch so it honours the same
+  // sizing decision the first-pass made. Stored locally for re-use below.
+  const optimisationFactors = { cpuOptimisationFactor, ramOptimisationFactor };
+  // Cost mode: 'lns' (default) = include in Lift-&-Shift totals.
+  // 'dr-defer' = SKU-size + price each row, but exclude from L&S totals; surface
+  // separately so Step 5 (DR Strategy) can read the sized SKUs and apply the
+  // chosen DR pattern's multiplier (e.g. 100% for active-active, 30% for hot ASR,
+  // 0% standing for cold ASR).
+  const effectiveCostMode = costMode === "dr-defer" ? "dr-defer" : "lns";
+  const isDeferred = effectiveCostMode === "dr-defer";
 
-  // Security cost — use override from options if provided, otherwise config
+  // PAYG hours-per-month override. Default falls back to the prebaked value (730)
+  // by signalling "use stored monthlyCost as-is". A clamped numeric value triggers
+  // dynamic recompute = retailPrice * hours.
+  const defaultPaygHours = sizingConfig.pricing?.payg?.hoursPerMonth || 730;
+  const hoursRaw = Number(paygHoursPerMonth);
+  const customPaygHours = (!isRI && Number.isFinite(hoursRaw) && hoursRaw > 0)
+    ? Math.min(Math.max(hoursRaw, 1), 744) // clamp to [1, 744] (max hours in a month)
+    : null;
+  const effectivePaygHours = customPaygHours || defaultPaygHours;
+  // Helper: resolve compute monthly cost from a pricing entry, scaling PAYG by hours when overridden.
+  const resolveMonthly = (entry) => {
+    if (!entry) return 0;
+    if (!isRI && customPaygHours && typeof entry.retailPrice === "number") {
+      return round2(entry.retailPrice * customPaygHours);
+    }
+    return entry.monthlyCost || 0;
+  };
+
+  // Security cost — use override from options if provided, otherwise config.
+  // Defender for Servers P2 is billed HOURLY (~$0.02/hr ≈ $15/server-month at
+  // 730 hrs). When the user overrides PAYG hours-per-month for compute, scale
+  // Defender by the same factor so the BOM stays internally consistent
+  // (otherwise compute drops to 25% while security stays at 100% — that's a bug).
+  // RI flows leave securityHoursFactor at 1.0 because reservations imply 24/7.
   const securityConfig = sizingConfig.security?.defenderForCloud;
   const securityEnabled = secOverride !== undefined ? secOverride : (securityConfig?.include !== false);
-  const securityPerServer = securityEnabled ? (securityPerServerPrice || securityConfig?.monthlyCostPerServer || 15.00) : 0;
+  const securityBasePerServer = securityEnabled ? (securityPerServerPrice || securityConfig?.monthlyCostPerServer || 15.00) : 0;
+  const securityHoursFactor = customPaygHours ? (customPaygHours / 730) : 1.0;
+  const securityPerServer = round2(securityBasePerServer * securityHoursFactor);
 
   let totalMonthlyCompute = 0;
   let totalMonthlyStorage = 0;
   let totalMonthlySecurity = 0;
+  // Deferred totals (only populated when costMode === 'dr-defer'). They mirror
+  // the L&S totals so Step 5 can pick up the full picture without re-running
+  // anything.
+  let deferredMonthlyCompute = 0;
+  let deferredMonthlyStorage = 0;
+  let deferredMonthlySecurity = 0;
   let suitableCount = 0;
   let notSuitableCount = 0;
   let rematchCount = 0;
@@ -786,13 +866,14 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
     // Resolve pricing for the matched VM
     let pricingResolved = false;
     if (vmName && vmPricing[vmName]) {
+      let entry;
       if (useAhub && isWindows && vmPricing[vmName]["linux"]) {
-        computeMonthlyCost = vmPricing[vmName]["linux"].monthlyCost;
+        entry = vmPricing[vmName]["linux"];
       } else {
         const os = isWindows ? "windows" : "linux";
-        const pricing = vmPricing[vmName][os] || vmPricing[vmName]["linux"] || vmPricing[vmName]["windows"];
-        if (pricing) computeMonthlyCost = pricing.monthlyCost;
+        entry = vmPricing[vmName][os] || vmPricing[vmName]["linux"] || vmPricing[vmName]["windows"];
       }
+      computeMonthlyCost = resolveMonthly(entry);
       if (computeMonthlyCost > 0) pricingResolved = true;
     }
 
@@ -810,13 +891,14 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
         // Check if this SKU actually has pricing
         const candidate = nextBest.name;
         if (vmPricing[candidate]) {
+          let entry;
           if (useAhub && isWindows && vmPricing[candidate]["linux"]) {
-            computeMonthlyCost = vmPricing[candidate]["linux"].monthlyCost;
+            entry = vmPricing[candidate]["linux"];
           } else {
             const os = isWindows ? "windows" : "linux";
-            const pricing = vmPricing[candidate][os] || vmPricing[candidate]["linux"] || vmPricing[candidate]["windows"];
-            if (pricing) computeMonthlyCost = pricing.monthlyCost;
+            entry = vmPricing[candidate][os] || vmPricing[candidate]["linux"] || vmPricing[candidate]["windows"];
           }
+          computeMonthlyCost = resolveMonthly(entry);
           if (computeMonthlyCost > 0) {
             vmName = candidate;
             pricingResolved = true;
@@ -865,9 +947,15 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
 
     const serverSecurityCost = securityEnabled ? securityPerServer : 0;
 
-    totalMonthlyCompute += computeMonthlyCost;
-    totalMonthlyStorage += storageMonthlyCost;
-    totalMonthlySecurity += serverSecurityCost;
+    if (isDeferred) {
+      deferredMonthlyCompute += computeMonthlyCost;
+      deferredMonthlyStorage += storageMonthlyCost;
+      deferredMonthlySecurity += serverSecurityCost;
+    } else {
+      totalMonthlyCompute += computeMonthlyCost;
+      totalMonthlyStorage += storageMonthlyCost;
+      totalMonthlySecurity += serverSecurityCost;
+    }
 
     return {
       serverName: server.serverName,
@@ -883,6 +971,9 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
       storageMonthlyCost: round2(storageMonthlyCost),
       securityMonthlyCost: round2(serverSecurityCost),
       totalMonthlyCost: round2(computeMonthlyCost + storageMonthlyCost + serverSecurityCost),
+      // When true, this row's cost is NOT counted in the env's L&S totals; it is
+      // surfaced under report.deferredSummary for Step 5 (DR Strategy) to pick up.
+      costDeferredToDr: isDeferred,
       suitability,
       isWindows,
       extraColumns: server._extraColumns || {},
@@ -904,22 +995,54 @@ function generateAssessmentReport(matchedServers, vmPricing, diskPricing, option
     pricingModel: pricingDef.label + (useAhub ? " + AHUB" : ""),
     pricingModelId: pricingModel,
     useAhub,
+    paygHoursPerMonth: !isRI ? effectivePaygHours : null,
     diskType: sizingConfig.storage.diskType,
     securityProduct: securityEnabled ? "Microsoft Defender for Cloud" : "None",
+    costMode: effectiveCostMode,
     sizingSummary: buildSizingSummary(serverDetails, sizingModeOverride || sizingConfig.rightSizing?.mode || "as-allocated"),
-    summary: {
-      totalServers: matchedServers.length,
-      suitable: suitableCount,
-      notSuitable: notSuitableCount,
-      rematched: rematchCount,
-      totalMonthlyCompute: round2(totalMonthlyCompute),
-      totalMonthlyStorage: round2(totalMonthlyStorage),
-      totalMonthlySecurity: round2(totalMonthlySecurity),
-      totalMonthlyCost: round2(totalMonthlyCompute + totalMonthlyStorage + totalMonthlySecurity),
-      totalAnnualCompute: round2(totalMonthlyCompute * 12),
-      totalAnnualStorage: round2(totalMonthlyStorage * 12),
-      totalAnnualSecurity: round2(totalMonthlySecurity * 12),
-      totalAnnualCost: round2((totalMonthlyCompute + totalMonthlyStorage + totalMonthlySecurity) * 12),
+    summary: (() => {
+      // Compute inventory-vs-recommended optimisation totals from serverDetails
+      // so they reconcile with whatever is in the report. Storage GB sums the
+      // source disk sizes (Azure-side disk size is essentially the same — we
+      // never shrink disks).
+      let invCores = 0, invRamMB = 0, recCores = 0, recRamMB = 0, srcDiskGB = 0;
+      for (const s of serverDetails) {
+        invCores += s.cores || 0;
+        invRamMB += s.memoryMB || 0;
+        recCores += s.vmCores || 0;
+        recRamMB += s.vmMemoryMB || 0;
+        for (const d of (s.diskDetails || [])) srcDiskGB += d.sourceSizeGB || 0;
+      }
+      return {
+        totalServers: matchedServers.length,
+        suitable: suitableCount,
+        notSuitable: notSuitableCount,
+        rematched: rematchCount,
+        totalMonthlyCompute: round2(totalMonthlyCompute),
+        totalMonthlyStorage: round2(totalMonthlyStorage),
+        totalMonthlySecurity: round2(totalMonthlySecurity),
+        totalMonthlyCost: round2(totalMonthlyCompute + totalMonthlyStorage + totalMonthlySecurity),
+        totalAnnualCompute: round2(totalMonthlyCompute * 12),
+        totalAnnualStorage: round2(totalMonthlyStorage * 12),
+        totalAnnualSecurity: round2(totalMonthlySecurity * 12),
+        totalAnnualCost: round2((totalMonthlyCompute + totalMonthlyStorage + totalMonthlySecurity) * 12),
+        // Inventory-vs-recommended optimisation footprint. Used by the Sizing
+        // Optimisation Summary card in the UI and by both XLSX exports.
+        inventoryCores: invCores,
+        inventoryRamMB: invRamMB,
+        recommendedCores: recCores,
+        recommendedRamMB: recRamMB,
+        sourceDiskGB: Math.round(srcDiskGB),
+      };
+    })(),
+    // Deferred summary: what this env's cost WOULD have been if it weren't deferred.
+    // Always present (zeros when not deferred). Step 5 reads this when applying DR strategies.
+    deferredSummary: {
+      totalServers: isDeferred ? matchedServers.length : 0,
+      totalMonthlyCompute: round2(deferredMonthlyCompute),
+      totalMonthlyStorage: round2(deferredMonthlyStorage),
+      totalMonthlySecurity: round2(deferredMonthlySecurity),
+      totalMonthlyCost: round2(deferredMonthlyCompute + deferredMonthlyStorage + deferredMonthlySecurity),
     },
     servers: serverDetails,
   };

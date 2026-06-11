@@ -26,6 +26,11 @@
       "treatZeroAs": "as-allocated",
       "treatMissingAs": "as-allocated",
       "_note": "Industry-standard formula (Azure Migrate aligned): requiredCores = ceil(observedCores * (max(observedCpu%, minimumUtilizationPercent) / 100) * cpuComfortFactor). Same pattern for RAM. Edge-case rules: (1) utilization == 0 OR missing -> fall back to as-allocated for that row (server may have been off / agent broken / measurement window too short - undersizing risk is real). (2) utilization < minimumUtilizationPercent (20%) -> floor to 20% (idle workloads still need baseline capacity to handle bursts and OS overhead). (3) utilization > 100% -> cap at 100% (measurement quirk). Percentile (95th) is taken from the source telemetry by Azure Migrate; this agent uses whatever single value the inventory provides as already representing that percentile."
+    },
+    "industryOptimized": {
+      "cpuFactor": 0.7,
+      "ramFactor": 0.8,
+      "_note": "Conservative right-sizing for inventories with NO performance telemetry. Industry rule-of-thumb (Gartner / Microsoft FastTrack): on-prem VMs typically run at 25-35% CPU utilisation, so multiplying allocated cores by 0.7 leaves the Azure VM at ~50% utilisation if the workload behaves as expected on-prem. RAM tends to be less oversized (apps grab and hold) so 0.8 is the safer default. Floors at compute.minimums.vCPUs / memoryGB. Both factors are user-editable in the UI."
     }
   },
 

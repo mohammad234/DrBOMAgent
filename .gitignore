@@ -8,3 +8,17 @@ saved_sessions/
 InventoryExamples/
 simulate_*.txt
 simulateUpload.js
+
+# Customer-specific export folders (timestamped)
+[0-9]*June*/
+[0-9]*Jul*/
+[0-9]*Aug*/
+[0-9]*Sep*/
+[0-9]*Oct*/
+[0-9]*Nov*/
+[0-9]*Dec*/
+[0-9]*Jan*/
+[0-9]*Feb*/
+[0-9]*Mar*/
+[0-9]*Apr*/
+[0-9]*May*/
