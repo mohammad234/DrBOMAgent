@@ -53,16 +53,18 @@
 
     "familySelection": {
       "method": "ram-per-core-ratio",
-      "_note": "ratio = requiredRamGB / requiredCores. Walk rules top-down; first rule whose maxRamPerCore >= ratio wins. families are tried in listed priority order during SKU matching.",
+      "_note": "ratio = requiredRamGB / requiredCores. Walk rules top-down; first rule whose maxRamPerCore >= ratio wins. families are tried in listed priority order during SKU matching. v6 listed before v5 so newer-generation SKUs (cheaper, AMD EPYC Genoa) win wherever the region carries them.",
       "rules": [
-        { "maxRamPerCore": 2.0,  "families": ["Dalsv5", "Dasv5"],  "intent": "low-memory general purpose" },
-        { "maxRamPerCore": 4.0,  "families": ["Dasv5", "Dalsv5"],  "intent": "general purpose (default)" },
+        { "maxRamPerCore": 2.0,  "families": ["Dalsv6", "Dalsv5", "Dlsv5", "Dasv5"],  "intent": "low-memory general purpose" },
+        { "maxRamPerCore": 4.0,  "families": ["Dasv5", "Dalsv6", "Dalsv5"],  "intent": "general purpose (default)" },
         { "maxRamPerCore": 8.0,  "families": ["Easv5", "Dasv5"],   "intent": "memory optimized" },
         { "maxRamPerCore": 999.0,"families": ["Easv5", "Mv2", "M"],"intent": "high memory / very large" }
       ],
       "defaultFamily": "Dasv5",
       "familyPrefixMap": {
+        "Dalsv6": "Standard_D{n}als_v6",
         "Dalsv5": "Standard_D{n}als_v5",
+        "Dlsv5":  "Standard_D{n}ls_v5",
         "Dasv5":  "Standard_D{n}as_v5",
         "Easv5":  "Standard_E{n}as_v5",
         "Mv2":    "Standard_M{n}s_v2",
