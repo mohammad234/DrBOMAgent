@@ -79,7 +79,23 @@
       ],
       "objective": "minimize monthlyComputePrice",
       "tieBreakers": ["smallest vCPUs", "smallest memoryGB", "alphabetical skuName"],
-      "fallback": "If no SKU in the selected family list satisfies both constraints, advance to the next family in the rule; if all listed families fail, search the entire region catalog for the cheapest SKU meeting both constraints and flag the row as 'family-fallback'."
+      "fallback": "If no SKU in the selected family list satisfies both constraints, advance to the next family in the rule; if all listed families fail, search the entire region catalog for the cheapest SKU meeting both constraints and flag the row as 'family-fallback'.",
+      "overProvisionGuard": {
+        "enabled": true,
+        "_note": "Unified scoring used by firstPassVmMatch. Replaces the previous hard family lock + req-only waste sort. The previous logic ignored over-source waste and frequently doubled RAM (e.g. 4c/8GB source → 4c/16GB SKU) because the smallest in-family SKU that met reqCores happened to carry more RAM than the source. With this guard enabled, the matcher penalises exceeding the SOURCE in either dimension (since right-sizing intent is to land at or below source), uses family preference as a soft penalty, and optionally snap-downs to a smaller SKU when the winner would exceed source by more than maxOverCpuPct/maxOverMemPct. Set enabled=false to fall back to legacy req-only waste sort.",
+        "weightReqCpu":      1.0,
+        "weightReqMem":      0.5,
+        "weightSrcOverCpu":  4.0,
+        "weightSrcOverMem":  2.0,
+        "familyMissPenalty": 0.5,
+        "snapDown": {
+          "enabled": true,
+          "_note": "When the score-winner exceeds source by more than maxOverCpuPct/maxOverMemPct, search for a SKU that stays at or below source while still within reqRelaxPct of req. Rationale: if right-sizing already shaved 20-30% off CPU/RAM and we still end up with a VM bigger than on-prem, the optimisation produced no real saving. Slight under-provision is acceptable because the workload was already running at that size on the source.",
+          "maxOverCpuPct": 25,
+          "maxOverMemPct": 25,
+          "reqRelaxPct":   15
+        }
+      }
     },
 
     "minimums": { "vCPUs": 2, "memoryGB": 4 },

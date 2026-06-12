@@ -232,19 +232,30 @@ async function fetchVmSizesWithSub(region, subscriptionId, token) {
 
   // Fallback: synthesize specs from SKU names for any VM still missing specs
   // Azure naming convention: Standard_<Family><Size><Variant>_v<Version>
-  // D-series: ~4GB/core, E-series: ~8GB/core, F-series: ~2GB/core, M-series: ~8GB/core
+  // Variant letters between size and _v indicate sub-family:
+  //   "ls" / "als" / "dls"  -> low-memory  (2 GB/vCPU)   e.g. D4als_v6, D4ls_v5
+  //   plain D / Da / Dad / Das / Dads      -> general (4 GB/vCPU)   e.g. D4as_v5
+  //   E / M / L family                     -> memory-opt (8 GB/vCPU) e.g. E4as_v5
+  //   F / Fa / Fas                         -> compute-opt (2 GB/vCPU) e.g. F4s_v2
   for (const vm of Object.values(vmSkuMap)) {
     if (vm.numberOfCores > 0 && vm.memoryInMB > 0) continue; // already has specs
-    const match = vm.name.match(/^Standard_([A-Z]+)(\d+)/i);
+    const match = vm.name.match(/^Standard_([A-Z]+)(\d+)([a-z]*)/i);
     if (!match) continue;
     const family = match[1].toUpperCase();
     const size = parseInt(match[2]);
+    const variant = (match[3] || "").toLowerCase();
     if (!size) continue;
-    // Memory ratio based on family
-    let memPerCore = 4; // default (D-series)
-    if (family.startsWith("E") || family.startsWith("M")) memPerCore = 8;
-    else if (family.startsWith("F")) memPerCore = 2;
-    else if (family.startsWith("L")) memPerCore = 8;
+    // Memory ratio based on family + variant
+    let memPerCore = 4; // default (D-series general)
+    if (family.startsWith("E") || family.startsWith("M") || family.startsWith("L")) {
+      memPerCore = 8;
+    } else if (family.startsWith("F")) {
+      memPerCore = 2;
+    }
+    // Low-memory variants (ls / als / dls) override family default to 2 GB/vCPU
+    if (/^a?d?ls$/.test(variant) || variant === "ls" || variant === "als" || variant === "dls") {
+      memPerCore = 2;
+    }
     vm.numberOfCores = size;
     vm.memoryInMB = size * memPerCore * 1024;
     vm.maxDataDiskCount = Math.max(4, size * 2);
@@ -339,38 +350,105 @@ function firstPassVmMatch(server, vmSizes, enabledSeries, cpuArchitecture, sized
     return sorted[0] || null;
   }
 
-  // Sort: prefer config-recommended families, then minimize waste
-  const familyPrefixMap = sizingConfig.compute.familySelection.familyPrefixMap || {};
-  candidates.sort((a, b) => {
-    // Family preference from config — use familyPrefixMap patterns
-    const famIdxA = selectedFamilies.findIndex(f => {
-      const pattern = familyPrefixMap[f];
-      if (pattern) {
-        // Convert "Standard_D{n}as_v5" to regex "Standard_D\d+as_v5"
-        const re = new RegExp("^" + pattern.replace("{n}", "\\d+") + "$");
-        return re.test(a.name);
-      }
-      return a.name.includes(f);
-    });
-    const famIdxB = selectedFamilies.findIndex(f => {
-      const pattern = familyPrefixMap[f];
-      if (pattern) {
-        const re = new RegExp("^" + pattern.replace("{n}", "\\d+") + "$");
-        return re.test(b.name);
-      }
-      return b.name.includes(f);
-    });
-    const famA = famIdxA >= 0 ? famIdxA : selectedFamilies.length + 10;
-    const famB = famIdxB >= 0 ? famIdxB : selectedFamilies.length + 10;
-    if (famA !== famB) return famA - famB;
+  // ============ UNIFIED SCORING (over-provision aware) ============
+  // Replaces the previous hard family lock + req-only waste sort. The previous
+  // logic ignored over-source waste, so a 4c/8GB source could be matched to a
+  // 4c/16GB SKU with zero penalty (RAM doubled). This scorer:
+  //   - keeps family preference but as a *soft* penalty, so a same-cost SKU
+  //     in a less-preferred family can win when it avoids over-provisioning
+  //   - penalises (vmCores - reqCores) and (vmMem - reqMem)  → minimise over-req waste
+  //   - penalises max(0, vmCores - sourceCores) and max(0, vmMem - sourceMem)
+  //     more strongly → strongly avoid exceeding source (right-sizing intent)
+  const guard = sizingConfig.compute?.selectionAlgorithm?.overProvisionGuard || {};
+  const guardEnabled = guard.enabled !== false; // default on
+  const wReqCpu  = guard.weightReqCpu        ?? 1.0;
+  const wReqMem  = guard.weightReqMem        ?? 0.5;   // per GB
+  const wSrcCpu  = guard.weightSrcOverCpu    ?? 4.0;   // per core over source
+  const wSrcMem  = guard.weightSrcOverMem    ?? 2.0;   // per GB over source
+  const wFamily  = guard.familyMissPenalty   ?? 0.5;   // per index step
 
-    // Minimize waste
-    const wasteA = (a.numberOfCores - reqCores) + (a.memoryInMB - reqMemMB) / 1024;
-    const wasteB = (b.numberOfCores - reqCores) + (b.memoryInMB - reqMemMB) / 1024;
-    return wasteA - wasteB;
+  const familyPrefixMap = sizingConfig.compute.familySelection.familyPrefixMap || {};
+  const familyIndexOf = (vmName) => {
+    for (let i = 0; i < selectedFamilies.length; i++) {
+      const f = selectedFamilies[i];
+      const pattern = familyPrefixMap[f];
+      if (pattern) {
+        const re = new RegExp("^" + pattern.replace("{n}", "\\d+") + "$");
+        if (re.test(vmName)) return i;
+      } else if (vmName.includes(f)) {
+        return i;
+      }
+    }
+    return selectedFamilies.length; // off-list = fixed penalty (one step beyond last)
+  };
+
+  const sourceCores = cores;
+  const sourceMemMB = memoryMB;
+  const scoreOf = (vm) => {
+    const overReqC = vm.numberOfCores - reqCores;
+    const overReqM = (vm.memoryInMB - reqMemMB) / 1024;
+    const overSrcC = Math.max(0, vm.numberOfCores - sourceCores);
+    const overSrcM = Math.max(0, (vm.memoryInMB - sourceMemMB) / 1024);
+    const fam = familyIndexOf(vm.name);
+    return (
+      wReqCpu * overReqC +
+      wReqMem * overReqM +
+      (guardEnabled ? wSrcCpu * overSrcC : 0) +
+      (guardEnabled ? wSrcMem * overSrcM : 0) +
+      wFamily * fam
+    );
+  };
+
+  candidates.sort((a, b) => {
+    const sa = scoreOf(a);
+    const sb = scoreOf(b);
+    if (sa !== sb) return sa - sb;
+    if (a.numberOfCores !== b.numberOfCores) return a.numberOfCores - b.numberOfCores;
+    if (a.memoryInMB !== b.memoryInMB) return a.memoryInMB - b.memoryInMB;
+    return a.name.localeCompare(b.name);
   });
 
-  const winner = candidates[0];
+  let winner = candidates[0];
+
+  // ============ OPTIONAL SNAP-DOWN ============
+  // If the winner exceeds source by more than maxOverSrcPct in either dimension,
+  // try to find a SKU that stays within source by relaxing the req constraint
+  // down to a tolerated floor. The intent: when right-sizing has already shaved
+  // CPU/RAM by 20-30%, ending up with a VM larger than the on-prem source means
+  // the optimisation worked on paper but produced no real saving. In that case
+  // we'd rather under-provision slightly (the source workload was already
+  // running there) than over-provision by 50-100%.
+  if (guardEnabled && (guard.snapDown?.enabled !== false) && winner) {
+    const maxOverCpuPct = guard.snapDown?.maxOverCpuPct ?? 25;  // % over source allowed
+    const maxOverMemPct = guard.snapDown?.maxOverMemPct ?? 25;
+    const reqRelaxPct   = guard.snapDown?.reqRelaxPct   ?? 15;  // how far below req we'll go
+
+    const overC = sourceCores > 0 ? ((winner.numberOfCores - sourceCores) / sourceCores) * 100 : 0;
+    const overM = sourceMemMB > 0 ? ((winner.memoryInMB - sourceMemMB) / sourceMemMB) * 100 : 0;
+
+    if (overC > maxOverCpuPct || overM > maxOverMemPct) {
+      const floorC = Math.max(minCores, Math.ceil(reqCores * (1 - reqRelaxPct / 100)));
+      const floorM = Math.max(minMemGB * 1024, Math.ceil(reqMemMB * (1 - reqRelaxPct / 100)));
+      const snapPool = pool.filter(vm =>
+        vm.numberOfCores >= floorC &&
+        vm.memoryInMB   >= floorM &&
+        vm.numberOfCores <= sourceCores &&
+        vm.memoryInMB   <= sourceMemMB
+      );
+      if (snapPool.length > 0) {
+        snapPool.sort((a, b) => {
+          // closest to req without exceeding source
+          const da = Math.abs(a.numberOfCores - reqCores) + Math.abs((a.memoryInMB - reqMemMB) / 1024);
+          const db = Math.abs(b.numberOfCores - reqCores) + Math.abs((b.memoryInMB - reqMemMB) / 1024);
+          if (da !== db) return da - db;
+          if (a.numberOfCores !== b.numberOfCores) return b.numberOfCores - a.numberOfCores;
+          return b.memoryInMB - a.memoryInMB;
+        });
+        winner = snapPool[0];
+      }
+    }
+  }
+
   return winner;
 }
 
